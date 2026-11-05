@@ -9,10 +9,19 @@ api_version: 1
 tags: [verification, evidence, safety, guardrails]
 provides_tools:
   - verify_claim
+  - query_receipts
 provides_hooks:
   - pre_tool_call
   - post_tool_call
 python_dependencies: []
+# requires_hermes: deliberately NOT declared. Verified against the Hermes
+# source (hermes_cli/plugins_manifest.py): running_hermes_version() returns
+# "unknown" on dev builds, and any floor spec fails version_satisfies() on
+# "unknown" — so declaring a floor would BLOCK loading on every dev build.
+# The APIs used here (register_tool/register_hook/get_config, pre/post
+# _tool_call hooks, plugin_data_dir) are all present in the current tree,
+# and omitting the floor is the load-safe choice. Revisit if Nous starts
+# stamping real versions on dev builds.
 config_schema:
   blocking_mode:
     type: bool
