@@ -39,6 +39,8 @@ class FakeCtx:
     def __init__(self):
         self.tools = {}
         self.hooks = {}
+        self.hook_options = {}
+        self.skills = {}
         self._config = {}
 
     def get_config(self, key, default=None):
@@ -52,6 +54,10 @@ class FakeCtx:
 
     def register_hook(self, event, fn, **kwargs):
         self.hooks.setdefault(event, []).append(fn)
+        self.hook_options[event] = kwargs
+
+    def register_skill(self, name, path):
+        self.skills[name] = path
 
 
 # ---------------------------------------------------------------- guard
@@ -200,8 +206,17 @@ def test_register():
           "pre_tool_call" in ctx.hooks, str(sorted(ctx.hooks)))
     check("register: post_tool_call hook registered",
           "post_tool_call" in ctx.hooks, str(sorted(ctx.hooks)))
-    check("register: transform_llm_output NOT registered (Codex's lane)",
-          "transform_llm_output" not in ctx.hooks, str(sorted(ctx.hooks)))
+    check("register: transform_llm_output registered with stream hold",
+          "transform_llm_output" in ctx.hooks and
+          ctx.hook_options["transform_llm_output"].get("hold_stream") is True,
+          str(sorted(ctx.hooks)))
+    check("register: bundled receipts skill registered",
+          ctx.skills.get("receipts") == PLUGIN_DIR / "skills" / "receipts" / "SKILL.md"
+          and ctx.skills["receipts"].is_file())
+    rewritten = ctx.hooks["transform_llm_output"][0](response_text="The spend completed.")
+    check("output hook: self-reported action stays declared",
+          rewritten.startswith("[hermes-verify] DECLARED / unverified") and
+          rewritten.endswith("The spend completed."))
     schema = ctx.tools["verify_claim"]["schema"]
     check("register: schema requires claim",
           schema["parameters"]["required"] == ["claim"], str(schema))

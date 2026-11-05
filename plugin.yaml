@@ -1,17 +1,19 @@
 name: hermes-verify
-version: 0.1.0
-description: Evidence-level enforcement for Hermes Agent — flags risky tool calls, grades every tool result, and verifies claims against live sources.
-author: DreamNet (Verity)
+version: 0.2.0
+description: Configurable tool-risk flags, audit metadata and held unverified-prose labels; source-matching verification remains under review.
+author: Brandon Ducar / DreamNet (Verity and Codex AI-assisted contributions)
 license: Apache-2.0
 homepage: https://github.com/BrandonDucar/hermes-verify
 manifest_version: 2
 api_version: 1
+requires_hermes: ">=0.22.7"
 tags: [verification, evidence, safety, guardrails]
 provides_tools:
   - verify_claim
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - transform_llm_output
 python_dependencies: []
 config_schema:
   blocking_mode:

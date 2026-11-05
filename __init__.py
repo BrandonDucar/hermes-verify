@@ -10,9 +10,9 @@ What it does
 * ``post_tool_call`` grader: attaches an evidence level to every tool result
   (RUNTIME-VERIFIED / CODE-VERIFIED / DECLARED / UNKNOWN) and writes the
   grade + receipt to the plugin data dir for audit.
-* ``verify_claim`` tool: checks a claim against a live source URL and returns
-  a graded verdict. Never fabricates: no source, a failed fetch, or a phrase
-  mismatch all return UNKNOWN with the reason.
+* ``verify_claim`` tool: development-only lexical comparison against fetched
+  text. Legacy grade labels are untrusted metadata, not semantic support or
+  independent factual verification.
 
 Design rules
 ------------
@@ -31,8 +31,10 @@ from pathlib import Path
 
 try:  # package import (Hermes loads the plugin directory as a package)
     from . import _verify as _v
+    from ._output import label_output
 except ImportError:  # standalone / test loading
     import _verify as _v
+    from _output import label_output
 
 logger = logging.getLogger(__name__)
 
@@ -145,13 +147,12 @@ def _on_post_tool_call(tool_name, args, result, task_id, duration_ms=None, **kwa
 VERIFY_CLAIM_SCHEMA = {
     "name": "verify_claim",
     "description": (
-        "Check a claim against a live source and return a graded verdict. "
-        "Pass the claim plus a source_url (an http(s) page that should state "
-        "it). Returns {level, verdict, evidence}. Levels: EXTERNALLY-VERIFIED "
-        "(source supports the claim), PROPOSED (partially supported), UNKNOWN "
-        "(no source, fetch failed, or source does not support it — absence of "
-        "support is NOT proof the claim is false). Use this before presenting "
-        "a factual claim as verified."
+        "Development-only keyword comparison against fetched source text. "
+        "Returns {level, verdict, evidence}, but legacy grades including "
+        "EXTERNALLY-VERIFIED are untrusted metadata: matching words do NOT "
+        "establish semantic support, source independence or factual truth. "
+        "Do not present a claim as verified based on this tool. Missing "
+        "sources or fetch failures return UNKNOWN, not proof of falsity."
     ),
     "parameters": {
         "type": "object",
@@ -187,15 +188,11 @@ def _verify_claim_handler(args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# TODO (Codex's lane): transform_llm_output hook
+# Output labeling
 # ---------------------------------------------------------------------------
-# Planned: a transform_llm_output hook (hold_stream=True) that labels claims
-# in the agent's finished reply with their evidence level before the user
-# sees them, so unverified claims cannot present as fact. NOT implemented in
-# this scaffold — Codex owns this hook. Do not implement here; coordinate
-# with Codex on the labeling format before wiring it up.
-# def _on_transform_llm_output(...):  # pragma: no cover - Codex's lane
-#     ...
+def _on_transform_llm_output(response_text, **kwargs):
+    """Label finished prose without trusting quoted grades as verification."""
+    return label_output(response_text)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +207,11 @@ def register(ctx):
     except Exception:
         _BLOCKING_MODE = False
 
+    # No compatibility fallback: a host without stream hold must refuse loading.
+    ctx.register_hook(
+        "transform_llm_output", _on_transform_llm_output, hold_stream=True,
+    )
+    ctx.register_skill("receipts", Path(__file__).parent / "skills" / "receipts" / "SKILL.md")
     ctx.register_tool(
         name="verify_claim",
         toolset="hermes_verify",

@@ -1,0 +1,11 @@
+hermes-verify
+Copyright 2026 Brandon Ducar and DreamNet contributors.
+
+The plugin scaffold, guard, result grader and source-matching tool were
+contributed by Verity, an AI assistant working under Brandon Ducar's direction.
+The held-output labeling helper, hook integration, bundled receipts skill and
+associated fixtures were contributed by Codex, an OpenAI coding assistant.
+
+Hermes Agent is a separate Nous Research project. This plugin uses its public
+plugin API; it does not bundle the Hermes source or model weights. Hackathon
+participation does not imply acceptance, endorsement or an award.
