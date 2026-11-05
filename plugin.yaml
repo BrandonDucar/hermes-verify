@@ -1,0 +1,25 @@
+name: hermes-verify
+version: 0.1.0
+description: Evidence-level enforcement for Hermes Agent — flags risky tool calls, grades every tool result, and verifies claims against live sources.
+author: DreamNet (Verity)
+license: Apache-2.0
+homepage: https://github.com/BrandonDucar/hermes-verify
+manifest_version: 2
+api_version: 1
+tags: [verification, evidence, safety, guardrails]
+provides_tools:
+  - verify_claim
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+python_dependencies: []
+config_schema:
+  blocking_mode:
+    type: bool
+    default: false
+    label: Blocking mode
+    description: "When on, flagged tool calls are blocked (pre_tool_call returns a block directive). When off (default), flagged calls are logged and allowed through."
+# capabilities: intentionally omitted — hermes-verify requests NO privileged
+# host surfaces (no tool override, no ctx.llm, no platform actions, no
+# secrets). It only observes tool calls, logs to its own data dir, and
+# fetches user-supplied URLs from the verify_claim tool.
