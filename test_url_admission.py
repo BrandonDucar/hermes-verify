@@ -46,15 +46,17 @@ class URLAdmissionChallenges(unittest.TestCase):
 
     def test_oversized_body_is_not_silently_truncated(self):
         response = mock.MagicMock()
-        response.__enter__.return_value = response
+        response.status = 200
         response.read.return_value = b"x" * (v.MAX_FETCH_BYTES + 1)
-        opener = mock.Mock()
-        opener.open.return_value = response
-        with mock.patch.object(v, "_validate_fetch_url"), mock.patch.object(
-            v.urllib.request, "build_opener", return_value=opener
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        url = "https://93.184.216.34/"
+        target = v._FetchTarget(url, v.urllib.parse.urlsplit(url), "93.184.216.34", 443, ())
+        with mock.patch.object(v, "_resolve_fetch_target", return_value=target), mock.patch.object(
+            v, "_connect_fetch_target", return_value=connection
         ):
             with self.assertRaisesRegex(ValueError, "HERMES_VERIFY_SOURCE_BODY_LIMIT"):
-                v._fetch_text("https://93.184.216.34/")
+                v._fetch_text(url)
         response.read.assert_called_once_with(v.MAX_FETCH_BYTES + 1)
 
     def test_oversized_host_status_is_unknown(self):

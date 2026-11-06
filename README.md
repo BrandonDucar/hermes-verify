@@ -1,7 +1,7 @@
 # hermes-verify
 
 Evidence labeling and configurable tool-risk interception for Hermes Agent.
-Version 0.4.0 is a combined development candidate, not a truth oracle or a complete
+Version 0.5.0 is a combined development candidate, not a truth oracle or a complete
 security boundary. Source matching and tool names do not establish that a
 claim is true or an action succeeded.
 
@@ -90,16 +90,35 @@ hermes plugins enable hermes-verify
 No API keys, no Python dependencies (stdlib only), no privileged
 capabilities requested. The plugin's only network access is the
 `verify_claim` tool fetching a URL the user (or the agent) supplies,
-10s timeout, 2 MiB cap, http(s) only, SSRF-guarded to public IPs
-(including selected redirect targets). Userinfo, port zero and non-global/shared
-addresses are refused. Residual SSRF note: DNS can change
-between the guard's check and the connect (TOCTOU); closing that needs
-connection-level IP pinning, which stdlib urllib does not offer.
+with a shared 10s monotonic network-wait budget, a 2 MiB body cap and at most ten
+redirects. HTTP and HTTPS connect directly to numeric addresses from a validated
+public-only DNS snapshot; redirects are resolved and validated separately within
+the same budget. The original hostname remains the HTTP Host and HTTPS certificate
+verification/SNI identity. Ambient proxies are not used. Userinfo, scoped IPv6,
+port zero and non-global/shared addresses are refused. HTTPS requires verified
+certificates and default system trust, not an unverified TLS fallback.
+
+Each raw receive, send, connect and TLS handshake uses the remaining budget,
+including reads performed inside the standard-library HTTP parser. Resolver wait
+is bounded, but an OS resolver already running cannot be cancelled. At most four
+resolver threads per loaded module can remain outstanding; their slots are held
+until completion, so additional requests fail closed while saturated. This is
+cooperative timing, not hard real-time cancellation of OS, certificate-store,
+scheduler or CPU work. Proxy-only networks may fail rather than bypass this policy.
+Address checks are not an egress firewall or permission to access a source;
+local routing, NAT infrastructure and endpoint authorization remain external controls.
 
 The combined candidate retains `requires_hermes: ">=0.22.7"` because held output
 requires that API. An unknown development-build identity must be resolved through
 supported upstream discovery, not by removing the gate or faking a stamp.
-Native validation of this combined candidate is pending.
+The v0.5 executable source passed a fresh real SDK Doctor registration check and
+six registered callback/receipt cases against Hermes 0.22.7 in an isolated
+source-import environment. Doctor observed two tools, three hooks and no findings;
+each native run reported two warnings whose details were not captured. These are
+scoped native results, not installed-runtime or full-validation certification.
+The SDK tracked-dirty observation timed out, so no clean-tree claim follows.
+Agent-stream delivery, strict-mode integration and full CLI validation remain
+pending. The earlier v0.4 results remain historical rather than being reused.
 
 ## Config
 
@@ -158,6 +177,7 @@ python3 test_output.py
 python3 test_registration.py
 python3 test_core_boundaries.py
 python3 test_url_admission.py
+python3 test_transport_boundaries.py
 ```
 
 The earlier local branch passed 75 synthetic cases: 35 legacy core, 34 output
@@ -167,20 +187,28 @@ v0.3 combined candidate passed 121 synthetic cases. The v0.4 candidate passed
 161 offline cases: 69 core, 34 output, six fake-registration, 31 core-boundary,
 nine URL-admission and 12 private guard challenges. These overlap the earlier
 121; they are not 282 unique cases. The 12 private guard challenges are retained
-in the local qualification audit, not included in the five commands above.
+in the local qualification audit, not included in the public commands above.
 The frozen 30-case core challenge set produced three passing and 27 failing
 assertions against the retained parent, with five denied read attempts reported
 separately by the audit guard. That baseline is not clean runtime qualification
 or a count of independent vulnerabilities. The candidate had zero denied attempts.
 The 31st core-boundary case covers the review-discovered empty-log v2 envelope;
 it failed against the pre-fix wrapper and passed after correction.
+The v0.5 transport suite uses synthetic DNS, socket, TLS, thread and clock boundaries
+with the real standard-library HTTP parser; it is not a live-network or TLS-peer
+certification. Qualification results must be bound to exact source and fixture pins.
+The pre-review candidate passed 174 cases in the six public suites above plus the
+same twelve private guard cases, 186 total. Review found three additional edges;
+four added regressions extend the transport suite to 29 cases, 190 overall.
+Execution results must name the exact source snapshot; repeated qualification
+is not another set of unique cases, and a pre-repair pass does not close a finding.
 Native hooks, actual stream delivery, transport policy and catalog admission
 remain separate checks. Existing unsafe-path findings are not closed by a banner
 or by changing a test expectation to match inherited behavior.
 
 ## Files
 
-- `plugin.yaml` - manifest v2, version0.4.0, declared tools/hooks and the retained
+- `plugin.yaml` - manifest v2, version0.5.0, declared tools/hooks and the retained
   `requires_hermes >=0.22.7` admission floor. No privileged override is requested.
 - `__init__.py` — `register(ctx)`, hook wrappers, `verify_claim` and
   `query_receipts` handlers.
@@ -191,6 +219,8 @@ or by changing a test expectation to match inherited behavior.
 - `test_output.py` — pure output-label fixtures without importing the plugin.
 - `test_verify.py` — offline test suite.
 - `test_registration.py` - fake-context registration fixtures, not native checks.
+- `test_transport_boundaries.py` - offline pinned-connection, proxy, redirect,
+  shared-deadline and resolver-capacity challenges; no real network operations.
 - `validation-report.json` - historical peer-reported validation of the earlier
   core, not native CLI validation or acceptance of this combined candidate.
   Its current aggregate `ok` is null; original reported success is retained

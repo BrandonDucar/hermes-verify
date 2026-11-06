@@ -1,12 +1,40 @@
 {
   "schemaVersion": "hermes-verify.validation-evidence.v2",
-  "candidateVersion": "0.4.0",
+  "candidateVersion": "0.5.0",
   "evidenceStage": "HISTORICAL_PEER_REPORT_NOT_CURRENT_VALIDATION",
   "ok": null,
   "historicalPeerReportedOk": true,
   "retainedInCommit": "5c8cad5b1d45eee91deeebf6a48754c18c8fba0c",
   "currentCandidateValidated": false,
   "nativeHermesQualified": false,
+  "currentScopedNativeEvidence": {
+    "candidateVersion": "0.5.0",
+    "sdkVersion": "0.22.7",
+    "sdkCommit": "b200f5bc60e31588ba2cb60e288029c4a54ba5fa",
+    "doctor": {
+      "passed": true,
+      "tools": 2,
+      "hooks": 3,
+      "findings": 0,
+      "receiptSha256": "cfe43f06eb2dd78c1815f399ce169b22651f15df54a5478ba3eb8d88b778a542"
+    },
+    "registeredBehavior": {
+      "passedCases": 6,
+      "failedCases": 0,
+      "registryRestored": true,
+      "remainingFixtureThreads": 0,
+      "receiptSha256": "db1f068062189af9710b0c7235f5cd32b6cbaf6d1baf7ed05aefd629a7366a63"
+    },
+    "warningsPerRun": 2,
+    "warningDetails": "NOT_CAPTURED",
+    "trackedDirtyObservation": "UNKNOWN_STATUS_TIMEOUT",
+    "independentReadbackSha256": "2b457dee3b94a164f446241974324873c2f9841bf8f44641492155e196575959",
+    "peerTests": false,
+    "fullValidatePassed": false,
+    "actualAgentStreamVerified": false,
+    "strictIntegrationVerified": false,
+    "scope": "Exact v0.5 executable source in an isolated source-import environment. Native receipts precede this documentation-only update; they do not certify installed runtime, live transport or catalog admission."
+  },
   "scope": "The checks below retain the earlier core's reported results. They do not validate the combined plugin, its version floor or held-output hook.",
   "warnings": [],
   "checks": [

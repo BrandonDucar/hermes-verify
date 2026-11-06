@@ -31,17 +31,22 @@ overstating it is not.
 
 import html
 import hashlib
+import http.client
+import io
 import ipaddress
 import json
 import math
 import re
 import socket
+import ssl
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Evidence levels
@@ -57,6 +62,10 @@ LEVELS = (
 )
 
 FETCH_TIMEOUT_S = 10
+MAX_FETCH_REDIRECTS = 10
+MAX_DNS_ANSWERS = 64
+MAX_CONNECT_ADDRESSES = 8
+_DNS_SLOTS = threading.BoundedSemaphore(4)
 MAX_FETCH_BYTES = 2 * 1024 * 1024  # 2 MiB cap on fetched pages
 MAX_RECEIPT_LIMIT = 100
 MAX_JSON_NODES = 4096
@@ -502,56 +511,262 @@ class _UnsafeURL(ValueError):
     """A fetch URL that fails the SSRF guard (non-public destination)."""
 
 
-def _validate_fetch_url(url: str) -> None:
-    """SSRF guard: allow only http(s) URLs whose host resolves entirely to
-    public IPs. Raises _UnsafeURL for anything else — private, loopback,
-    link-local, reserved, multicast, unspecified, unresolvable, or a
-    non-http(s) scheme. Literal IPs are checked without DNS; hostnames are
-    resolved with getaddrinfo and EVERY resolved address must be public.
+class _Deadline:
+    def __init__(self, timeout):
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("HERMES_VERIFY_SOURCE_TIMEOUT_INVALID")
+        self.expires = time.monotonic() + timeout
 
-    Residual risk (documented, not hidden): DNS can change between this
-    check and the connect (TOCTOU / DNS rebinding). Closing that needs
-    connection-level IP pinning, which stdlib urllib does not offer without
-    a custom transport. Connection binding and proxy behavior remain pending
-    transport qualification, not certified by this address check.
-    """
+    def remaining(self):
+        remaining = self.expires - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("HERMES_VERIFY_SOURCE_DEADLINE")
+        return remaining
+
+
+class _FetchTarget(NamedTuple):
+    url: str
+    parsed: urllib.parse.SplitResult
+    host: str
+    port: int
+    addresses: tuple
+
+
+def _bounded_getaddrinfo(host, port, deadline):
+    """Bound caller wait and outstanding resolvers, not OS resolver cancellation."""
+    deadline.remaining()
+    if not _DNS_SLOTS.acquire(blocking=False):
+        raise TimeoutError("HERMES_VERIFY_SOURCE_RESOLVERS_BUSY")
+    done = threading.Event()
+    outcome = {}
+
+    def resolve():
+        try:
+            outcome["rows"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception as error:
+            outcome["error"] = error
+        finally:
+            _DNS_SLOTS.release()
+            done.set()
+
+    worker = threading.Thread(target=resolve, name="hermes-verify-dns", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        _DNS_SLOTS.release()
+        raise OSError("HERMES_VERIFY_SOURCE_RESOLVER_START_FAILED") from None
+    if not done.wait(deadline.remaining()):
+        raise TimeoutError("HERMES_VERIFY_SOURCE_DEADLINE")
+    deadline.remaining()
+    if "error" in outcome:
+        raise _UnsafeURL("SOURCE_URL_RESOLUTION_FAILED") from None
+    return outcome["rows"]
+
+
+def _public_ip(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise _UnsafeURL("SOURCE_URL_REJECTED") from None
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    if (not address.is_global or (mapped is not None and not mapped.is_global)
+            or address.is_private or address.is_loopback or address.is_link_local
+            or address.is_reserved or address.is_multicast or address.is_unspecified):
+        raise _UnsafeURL("SOURCE_URL_REJECTED")
+    return address
+
+
+def _resolve_fetch_target(url, deadline):
+    deadline.remaining()
     if type(url) is not str or len(url) > 4096 or any(ord(c) < 33 or ord(c) == 127 for c in url):
         raise _UnsafeURL("SOURCE_URL_REJECTED")
     try:
-        parsed = urllib.parse.urlparse(url)
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
     except ValueError:
         raise _UnsafeURL("SOURCE_URL_REJECTED") from None
     if parsed.scheme.lower() not in ("http", "https"):
-        raise _UnsafeURL(f"unsupported scheme {parsed.scheme!r}; only http(s) allowed")
-    host = parsed.hostname
-    if not host or len(host) > 253 or parsed.username is not None or parsed.password is not None:
-        raise _UnsafeURL("URL has no host")
+        raise _UnsafeURL("SOURCE_URL_REJECTED")
+    if (not host or len(host) > 253 or parsed.username is not None or parsed.password is not None
+            or "%" in host or "\\" in host or port == 0):
+        raise _UnsafeURL("SOURCE_URL_REJECTED")
     try:
-        port = parsed.port
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        raise _UnsafeURL("SOURCE_URL_REJECTED") from None
+    port = port or (443 if parsed.scheme == "https" else 80)
+    try:
+        literal = ipaddress.ip_address(host)
     except ValueError:
-        raise _UnsafeURL("URL has an invalid port")
-    if port == 0:
-        raise _UnsafeURL("URL has an invalid port")
-    try:
-        infos = socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80),
-                                   type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        raise _UnsafeURL(f"cannot resolve host {host!r}")
-    if not infos:
-        raise _UnsafeURL(f"cannot resolve host {host!r}")
-    for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
-        if (not ip.is_global or (mapped is not None and not mapped.is_global)
-                or ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            raise _UnsafeURL(f"host {host!r} resolves to non-public address {ip}")
+        rows = _bounded_getaddrinfo(host, port, deadline)
+    else:
+        family = socket.AF_INET6 if literal.version == 6 else socket.AF_INET
+        rows = [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port))]
+    if not rows or len(rows) > MAX_DNS_ANSWERS:
+        raise _UnsafeURL("SOURCE_URL_RESOLUTION_FAILED")
+    addresses = []
+    for family, _kind, _proto, _canonical, sockaddr in rows:
+        address = _public_ip(sockaddr[0])
+        if family != (socket.AF_INET6 if address.version == 6 else socket.AF_INET):
+            raise _UnsafeURL("SOURCE_URL_REJECTED")
+        numeric = (str(address), port, 0, 0) if address.version == 6 else (str(address), port)
+        item = (family, numeric)
+        if item not in addresses:
+            addresses.append(item)
+    deadline.remaining()
+    return _FetchTarget(urllib.parse.urldefrag(url).url, parsed, host, port, tuple(addresses))
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Admission-only compatibility helper; actual fetch also pins its connection."""
+    _resolve_fetch_target(url, _Deadline(FETCH_TIMEOUT_S))
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, transport):
+        super().__init__()
+        self.transport = transport
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if self.closed:
+            raise ValueError("SOURCE_READER_CLOSED")
+        self.transport._sock.settimeout(self.transport.deadline.remaining())
+        count = self.transport._sock.recv_into(buffer)
+        self.transport.deadline.remaining()
+        return count
+
+    def close(self):
+        if not self.closed:
+            try:
+                super().close()
+            finally:
+                self.transport._reader_closed()
+
+
+class _DeadlineSocket:
+    """Socket facade with one shared I/O deadline and makefile ownership semantics."""
+    def __init__(self, sock, deadline):
+        self._sock, self.deadline = sock, deadline
+        self._readers = 0
+        self._closing = self._raw_closed = False
+
+    def sendall(self, data):
+        self.deadline.remaining()
+        view = memoryview(data)
+        sent = 0
+        while sent < len(view):
+            self._sock.settimeout(self.deadline.remaining())
+            count = self._sock.send(view[sent:])
+            self.deadline.remaining()
+            if type(count) is not int or count <= 0 or count > len(view) - sent:
+                raise ConnectionError("HERMES_VERIFY_SOURCE_SEND_NO_PROGRESS")
+            sent += count
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("SOURCE_READER_MODE")
+        self._readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def _reader_closed(self):
+        self._readers -= 1
+        self._close_if_released()
+
+    def _close_if_released(self):
+        if self._closing and not self._readers and not self._raw_closed:
+            self._raw_closed = True
+            self._sock.close()
+
+    def close(self):
+        self._closing = True
+        self._close_if_released()
+
+
+def _connect_fetch_target(target, deadline):
+    for family, numeric in target.addresses[:MAX_CONNECT_ADDRESSES]:
+        deadline.remaining()
+        sock = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        try:
+            sock.settimeout(deadline.remaining())
+            sock.connect(numeric)
+            deadline.remaining()
+            if target.parsed.scheme == "https":
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = True
+                context.verify_mode = ssl.CERT_REQUIRED
+                context.verify_flags |= ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+                context.load_default_certs()
+                context.set_alpn_protocols(["http/1.1"])
+                sock.settimeout(deadline.remaining())
+                sock = context.wrap_socket(sock, server_hostname=target.host)
+                deadline.remaining()
+            connection = http.client.HTTPConnection(target.host, target.port, timeout=deadline.remaining())
+            connection.auto_open = 0
+            connection.sock = _DeadlineSocket(sock, deadline)
+            return connection
+        except OSError:
+            sock.close()
+            deadline.remaining()
+        except BaseException:
+            sock.close()
+            raise
+    raise OSError("HERMES_VERIFY_SOURCE_CONNECT_FAILED")
+
+
+def _fetch_bytes(url, *, _target=None, _deadline=None):
+    deadline = _deadline or _Deadline(FETCH_TIMEOUT_S)
+    target = _target or _resolve_fetch_target(url, deadline)
+    visited = set()
+    for redirect_count in range(MAX_FETCH_REDIRECTS + 1):
+        if target.url in visited:
+            raise ValueError("HERMES_VERIFY_SOURCE_REDIRECT_LOOP")
+        visited.add(target.url)
+        connection = _connect_fetch_target(target, deadline)
+        response = None
+        try:
+            host_header = "[" + target.host + "]" if ":" in target.host else target.host
+            if target.parsed.port is not None:
+                host_header += ":" + str(target.port)
+            path = urllib.parse.quote(target.parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+            if target.parsed.query:
+                path += "?" + urllib.parse.quote(target.parsed.query, safe="/%?:@!$&'()*+,;=-._~")
+            connection.request("GET", path, headers={"Host": host_header, "Connection": "close",
+                               "Accept-Encoding": "identity", "User-Agent": "hermes-verify/0.5.0 (+source text check)"})
+            response = connection.getresponse()
+            deadline.remaining()
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                if not location or redirect_count == MAX_FETCH_REDIRECTS:
+                    raise ValueError("HERMES_VERIFY_SOURCE_REDIRECT_LIMIT")
+                next_url = urllib.parse.urljoin(target.url, location)
+            elif 200 <= response.status < 300:
+                raw = response.read(MAX_FETCH_BYTES + 1)
+                deadline.remaining()
+                if len(raw) > MAX_FETCH_BYTES:
+                    raise ValueError("HERMES_VERIFY_SOURCE_BODY_LIMIT")
+                if response.length is not None and response.length > 0:
+                    raise ValueError("HERMES_VERIFY_SOURCE_BODY_INCOMPLETE")
+                return raw
+            else:
+                raise ValueError("HERMES_VERIFY_SOURCE_HTTP_STATUS")
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+        target = _resolve_fetch_target(next_url, deadline)
+    raise ValueError("HERMES_VERIFY_SOURCE_REDIRECT_LIMIT")
 
 
 class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Re-validate every redirect target with the SSRF guard before
-    following it — a public URL must not smuggle the fetch to localhost
-    or the cloud metadata endpoint via a 3xx."""
+    """Legacy admission-only helper, not the pinned fetch transport.
+
+    Compatibility callers can validate redirect addresses here, but this
+    helper alone does not bind the subsequent connection to those addresses.
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
         _validate_fetch_url(newurl)
@@ -595,16 +810,10 @@ def _best_sentence(page: str, phrases: list[str]) -> tuple[int, str]:
     return best_hits, best_text
 
 
-def _fetch_text(url: str) -> str:
-    """Fetch a URL as text through the SSRF-guarded opener (redirects
-    re-validated). Raises on any failure. Stdlib only."""
-    _validate_fetch_url(url)
-    opener = urllib.request.build_opener(_SSRFRedirectHandler())
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "hermes-verify/0.4.0 (+source text check)"}
-    )
-    with opener.open(req, timeout=FETCH_TIMEOUT_S) as resp:
-        raw = resp.read(MAX_FETCH_BYTES + 1)
+def _fetch_text(url: str, *, _target=None, _deadline=None) -> str:
+    """Fetch public text through pinned direct connections; never use ambient proxies."""
+    deadline = _deadline or _Deadline(FETCH_TIMEOUT_S)
+    raw = _fetch_bytes(url, _target=_target, _deadline=deadline)
     if len(raw) > MAX_FETCH_BYTES:
         raise ValueError("HERMES_VERIFY_SOURCE_BODY_LIMIT")
     text = raw.decode("utf-8", errors="replace")
@@ -612,7 +821,9 @@ def _fetch_text(url: str) -> str:
     text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    return html.unescape(text).lower()
+    text = html.unescape(text).lower()
+    deadline.remaining()
+    return text
 
 
 def verify_claim(
@@ -623,8 +834,11 @@ def verify_claim(
     """Compare bounded source text; lexical overlap never verifies world truth.
 
     fetch_fn (optional, for tests): callable(url) -> page text. Defaults
-    to the real urllib fetch. The SSRF guard runs BEFORE any fetcher, so
+    to the pinned direct transport. The SSRF guard runs BEFORE any fetcher, so
     even an injected fetch_fn never sees a non-public URL.
+
+    An injected fetch_fn is trusted caller code: its own I/O, DNS and duration
+    are not constrained here. The built-in pinned transport shares one budget.
 
     Support is measured per sentence: the score is the fraction of the
     claim's key phrases present in the SINGLE best sentence. Scattered
@@ -658,11 +872,18 @@ def verify_claim(
     if not source_url:
         return out("UNKNOWN", "cannot verify without a source",
                    {"reason": "no source_url provided"})
+    deadline = _Deadline(FETCH_TIMEOUT_S)
+    target = None
     try:
-        _validate_fetch_url(source_url)
+        if fetch_fn is not None:
+            _validate_fetch_url(source_url)
+        else:
+            target = _resolve_fetch_target(source_url, deadline)
     except _UnsafeURL:
         return out("UNKNOWN", "source URL blocked by SSRF guard",
                    {"reason": "SOURCE_URL_REJECTED"})
+    except (TimeoutError, OSError):
+        return out("UNKNOWN", "source fetch failed", {"reason": "SOURCE_RESOLUTION_UNAVAILABLE"})
     safe_source_url = source_url
 
     phrases = _key_phrases(claim)
@@ -670,9 +891,8 @@ def verify_claim(
         return out("UNKNOWN", "claim has no checkable content words",
                    {"reason": "no key phrases extracted from claim"})
 
-    fetcher = fetch_fn or _fetch_text
     try:
-        page = fetcher(source_url)
+        page = fetch_fn(source_url) if fetch_fn is not None else _fetch_text(source_url, _target=target, _deadline=deadline)
         if type(page) is not str or len(page) > MAX_FETCH_BYTES:
             raise ValueError("HERMES_VERIFY_SOURCE_TEXT_LIMIT")
     except Exception as exc:  # noqa: BLE001 — any fetch failure is UNKNOWN

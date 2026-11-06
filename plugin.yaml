@@ -1,5 +1,5 @@
 name: hermes-verify
-version: 0.4.0
+version: 0.5.0
 description: Configurable tool-risk flags, audit metadata and held unverified-prose labels; source-matching verification remains under review.
 author: Brandon Ducar / DreamNet (Verity and Codex AI-assisted contributions)
 license: Apache-2.0
