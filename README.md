@@ -1,15 +1,17 @@
 # hermes-verify
 
 Evidence labeling and configurable tool-risk interception for Hermes Agent.
-Version 0.2.0 is a development candidate, not a truth oracle or a complete
+Version 0.3.0 is a combined development candidate, not a truth oracle or a complete
 security boundary. Source matching and tool names do not establish that a
 claim is true or an action succeeded.
 
 Built for the **Nous Research Hermes Agent Plugin Hackathon** (Nov 2026).
-Scaffold by Verity, with the output hook, bundled skill and offline output
+Core and subsequent hardening by Verity, with the output hook, bundled skill and offline output
 fixtures contributed by Codex. These are AI-assisted contributions under
 Brandon Ducar's direction. Native qualification and adversarial review are
 separate from the offline fixtures; catalog submission is not yet complete.
+This combines Verity's public `5c8cad5b1d45eee91deeebf6a48754c18c8fba0c`
+with Codex's local `82141f73414d234c2e6af6b6978759e274bac33e`, retaining both histories.
 
 ## Held Output And Receipts
 
@@ -37,10 +39,11 @@ It is namespaced and read-only; no existing memory or skills are overwritten.
 
 | Piece | How it works |
 | --- | --- |
-| **pre_tool_call guard** | Inspects every tool call before it runs. Calls that spend money, send messages, publish, deploy, or touch credentials are **flagged and logged** (tool name, timestamp, category, reason) to the plugin data dir. By default the call still runs — flag-and-log. |
-| **post_tool_call grader** | Grades every tool result with an evidence level and writes the grade + receipt to an audit log (`grades_log.jsonl`). |
+| **pre_tool_call guard** | Token-based classification of spend, send, publish, deploy, credential and generic execution tools. Default mode logs and allows; explicit blocking mode vetoes flagged calls. Exceptional paths remain under review. |
+| **post_tool_call grader** | Writes result-grade metadata considering host status and structured errors. It does not independently verify action completion or rewrite model-bound tool results. |
 | **transform_llm_output** | Holds the finished reply on supported Hermes surfaces and adds an explicit unverified-prose label. This is not per-claim truth verification. |
 | **verify_claim tool** | Development-only lexical comparison against fetched source text. Returned legacy grades are untrusted metadata, not semantic support or independent factual verification. Missing sources and fetch failures return `UNKNOWN`. |
+| **query_receipts tool** | Read-only access to the guard/grades audit logs (`log: "guard"` or `"grades"`, limit 1–100, default 20) so the agent can show receipts instead of claiming them from memory. |
 
 ## Evidence levels
 
@@ -64,9 +67,10 @@ Legacy grading behavior retained from the scaffold:
 
 - Read/observation tools (`read_file`, `web_search`, `web_fetch`, …) →
   `RUNTIME-VERIFIED` for the observation itself.
-- Write/action tools (`write_file`, `send_email`, `terminal`, …) →
-  `CODE-VERIFIED` for the execution.
-- Empty or error-looking results → `UNKNOWN`.
+- Write/action tools (`write_file`, `send_email`, `terminal`, `stripe_checkout`, …) →
+  `CODE-VERIFIED` for the execution. Action hints win over read hints.
+- Empty results, host-reported errors (`status="error"`), or structured
+  error reports → `UNKNOWN`.
 - Anything unclassified → `DECLARED`.
 - `verify_claim` results pass their own level through.
 
@@ -80,7 +84,15 @@ hermes plugins enable hermes-verify
 No API keys, no Python dependencies (stdlib only), no privileged
 capabilities requested. The plugin's only network access is the
 `verify_claim` tool fetching a URL the user (or the agent) supplies,
-10s timeout, 2 MiB cap, http(s) only.
+10s timeout, 2 MiB cap, http(s) only, SSRF-guarded to public IPs
+(including redirect targets). Residual SSRF note: DNS can change
+between the guard's check and the connect (TOCTOU); closing that needs
+connection-level IP pinning, which stdlib urllib does not offer.
+
+The combined candidate retains `requires_hermes: ">=0.22.7"` because held output
+requires that API. An unknown development-build identity must be resolved through
+supported upstream discovery, not by removing the gate or faking a stamp.
+Native validation of this combined candidate is pending.
 
 ## Config
 
@@ -90,6 +102,10 @@ capabilities requested. The plugin's only network access is the
 
 Blocking is a veto, not an approval interface or a one-time approval token.
 This development mode does not implement an approval-and-resume workflow.
+The combined candidate keeps a blocking decision when classification, receipt
+writing or logging fails. Configuration must be an actual boolean; a read error
+or malformed value does not silently turn an established strict mode off.
+Host behavior when any plugin fails loading still needs native qualification.
 
 Set it in the Desktop app (Settings → Plugins → hermes-verify) or in
 `config.yaml` under `plugins.entries.hermes-verify.settings.blocking_mode`.
@@ -97,33 +113,57 @@ Set it in the Desktop app (Settings → Plugins → hermes-verify) or in
 ## Audit logs
 
 Logs live in the plugin data dir (`<HERMES_HOME>/plugin-data/hermes-verify/`,
-survives updates/removes) as JSONL — one record per line, no argument
-values ever recorded:
+survives updates/removes) as JSONL, one record per line. Argument values are not
+intentionally recorded, but arbitrary key names, identifiers and diagnostics
+remain unqualified for privacy. Use synthetic inputs during qualification:
 
-- `guard_log.jsonl` — flagged tool calls: timestamp, tool, task id,
-  categories, reasons, arg key names only, blocked yes/no.
+- `guard_log.jsonl` - newly flagged calls: timestamp, tool/task digests, fixed
+  categories/reason codes, argument-key count and blocked yes/no. Arbitrary key
+  names and exception messages are omitted from these new guard records.
 - `grades_log.jsonl` — graded tool results: timestamp, tool, task id,
   level, receipt (tool, timestamp, duration, basis).
 
+Read them live with the `query_receipts` tool instead of opening the
+files by hand.
+Old records are not rewritten. Digests can correlate identifiers and are not
+anonymization; grader records and raw receipt queries remain separate privacy
+review scope. This is not a universal privacy guarantee.
+
 ## Tests
 
-Stdlib only, no network, no Hermes needed:
+Stdlib fixtures do not require a model or native Hermes. The raw core suite can
+write log files and perform DNS resolution; isolated qualification must bind
+temporary storage and synthetic resolution before executing it. Commands below
+are suite entrypoints, not proof that those effects have been contained:
 
 ```bash
 python3 test_verify.py
 python3 test_output.py
+python3 test_registration.py
 ```
 
-Prints PASS/FAIL per case and exits non-zero if anything fails.
+The earlier local branch passed 75 synthetic cases: 35 legacy core, 34 output
+and six fake-registration cases. Verity's later core reports 67 cases. These
+are overlapping tests of different snapshots, not 142 independent cases. This
+combined candidate needs its own source-bound run and independent review.
+Native hooks, actual stream delivery, transport policy and catalog admission
+remain separate checks. Existing unsafe-path findings are not closed by a banner
+or by changing a test expectation to match inherited behavior.
 
 ## Files
 
-- `plugin.yaml` — manifest (v2). No `capabilities` block: the plugin
-  requests no privileged host surfaces.
-- `__init__.py` — `register(ctx)`, hook wrappers, `verify_claim` handler.
+- `plugin.yaml` - manifest v2, version0.3.0, declared tools/hooks and the retained
+  `requires_hermes >=0.22.7` admission floor. No privileged override is requested.
+- `__init__.py` — `register(ctx)`, hook wrappers, `verify_claim` and
+  `query_receipts` handlers.
 - `_verify.py` — pure-stdlib logic (guard classification, grading,
-  claim verification). Importable and testable without Hermes.
+  claim verification, URL checks and receipt reads). Importable without Hermes.
 - `_output.py` — bounded whole-output labeling; no I/O or evidence promotion.
 - `skills/receipts/SKILL.md` — namespaced reporting workflow, not permission.
 - `test_output.py` — pure output-label fixtures without importing the plugin.
 - `test_verify.py` — offline test suite.
+- `test_registration.py` - fake-context registration fixtures, not native checks.
+- `validation-report.json` - historical peer-reported validation of the earlier
+  core, not native CLI validation or acceptance of this combined candidate.
+  Its current aggregate `ok` is null; original reported success is retained
+  explicitly as historical evidence rather than reused as a current green gate.

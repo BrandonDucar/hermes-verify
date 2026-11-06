@@ -14,14 +14,32 @@ Evidence levels (strongest -> weakest claim about a statement):
   DECLARED            — asserted by the agent or a tool, not checked.
   PROPOSED            — a hypothesis / partial support; needs checking.
   UNKNOWN             — no usable evidence either way. Never fabricate.
+
+Matching rules (hardened, Nov 5 teardown)
+------------------------------------------
+Tool-name and argument-key matching is TOKEN based, not substring based:
+names are split on separators and camelCase humps, and a pattern matches
+only when its tokens appear as a contiguous run of the name's tokens.
+That kills the old false positives ("checkout" is not "check",
+"reorder" is not "order", "retarget" is not "get") while keeping real
+matches ("stripe_checkout" is spend, "get_target" is a read).
+
+Grading order is exec-first: a tool that both reads and acts is graded
+as an action (CODE-VERIFIED), because understating evidence is safe and
+overstating it is not.
 """
 
 import html
+import ipaddress
 import json
 import re
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Evidence levels
@@ -38,6 +56,7 @@ LEVELS = (
 
 FETCH_TIMEOUT_S = 10
 MAX_FETCH_BYTES = 2 * 1024 * 1024  # 2 MiB cap on fetched pages
+MAX_RECEIPT_LIMIT = 100
 
 
 def utc_now() -> str:
@@ -46,14 +65,59 @@ def utc_now() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Token matching — the fix for substring false positives/negatives
+# ---------------------------------------------------------------------------
+
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_SEPARATOR_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _tokens(name: str) -> list[str]:
+    """Split a tool/arg name into lowercase tokens.
+
+    Splits on separators (``_``, ``-``, ``.``, …) and on camelCase humps:
+    ``"stripeCheckout"`` -> ``["stripe", "checkout"]``,
+    ``"get_target"`` -> ``["get", "target"]``.
+    """
+    parts: list[str] = []
+    for chunk in _SEPARATOR_RE.split(name or ""):
+        if not chunk:
+            continue
+        parts.extend(_CAMEL_SPLIT_RE.split(chunk))
+    return [p.lower() for p in parts if p]
+
+
+def _pattern_matches(name_tokens: list[str], pattern: str) -> bool:
+    """True when the pattern's tokens appear as a contiguous run of the
+    name's tokens. ``"post_message"`` matches ``post_message`` and
+    ``send_post_message`` but not ``post`` alone; ``"check"`` matches
+    ``check_status`` but not ``checkout``."""
+    pat = _tokens(pattern)
+    if not pat or len(pat) > len(name_tokens):
+        return False
+    return any(
+        name_tokens[i:i + len(pat)] == pat
+        for i in range(len(name_tokens) - len(pat) + 1)
+    )
+
+
+def _any_pattern_matches(name: str, patterns: list[str]) -> Optional[str]:
+    """First pattern that token-matches ``name``, or None."""
+    toks = _tokens(name)
+    for pat in patterns:
+        if _pattern_matches(toks, pat):
+            return pat
+    return None
+
+
+# ---------------------------------------------------------------------------
 # pre_tool_call guard — classify risky tool calls
 # ---------------------------------------------------------------------------
 
-# Patterns are matched case-insensitively against the tool name and (for
-# arg_keys) against argument key names. Values are NEVER matched or logged
-# except for the credential value-pattern check, which records only the
-# key name, never the value itself.
-_RISK_PATTERNS = {
+# Patterns are matched TOKEN-wise against the tool name and argument KEY
+# names. Values are NEVER matched or logged except for the credential
+# value-pattern check, which records only the key name, never the value.
+_RISK_PATTERNS: dict[str, dict[str, list[str]]] = {
     "spend": {
         "name": ["pay", "charge", "purchase", "buy", "checkout", "stripe",
                  "billing", "subscribe", "invoice", "transfer", "withdraw",
@@ -81,6 +145,17 @@ _RISK_PATTERNS = {
         "arg_keys": ["api_key", "apikey", "token", "secret", "password",
                      "credential", "auth", "passwd"],
     },
+    # Generic execution tools can do ANYTHING the other categories cover
+    # (a shell can spend, send, publish, deploy, and exfiltrate) but their
+    # payload is opaque to name matching. Flag them as their own category:
+    # always logged, blocked in blocking_mode. A flag here says "this tool
+    # can do anything", not "this call did something risky".
+    "exec": {
+        "name": ["terminal", "shell", "exec", "execute", "bash", "zsh",
+                 "powershell", "cmd", "run", "command", "console",
+                 "subprocess", "repl", "sh"],
+        "arg_keys": ["command", "script", "shell_command"],
+    },
 }
 
 # Value shapes that look like a secret. Only the ARG KEY is ever recorded.
@@ -90,7 +165,7 @@ _SECRET_VALUE_RE = re.compile(
 )
 
 
-def _iter_arg_keys(args, _depth=0):
+def _iter_arg_keys(args: Any, _depth: int = 0):
     """Yield (key, value) pairs from nested arg dicts, depth-capped."""
     if not isinstance(args, dict) or _depth > 3:
         return
@@ -100,30 +175,34 @@ def _iter_arg_keys(args, _depth=0):
             yield from _iter_arg_keys(value, _depth + 1)
 
 
-def classify_tool_call(tool_name, args):
+def classify_tool_call(tool_name: str, args: Any) -> list[dict[str, str]]:
     """Classify a tool call into risk categories.
 
     Returns a list of {"category": ..., "reason": ...} dicts (empty = benign).
-    Matching is on tool name + argument KEY names only. No argument value
-    is ever returned or logged.
+    Matching is token-based on tool name + argument KEY names only. No
+    argument value is ever returned or logged.
     """
-    name = (tool_name or "").lower()
-    flags = []
+    name = tool_name or ""
+    flags: list[dict[str, str]] = []
     arg_pairs = list(_iter_arg_keys(args or {}))
-    arg_keys = [k.lower() for k, _ in arg_pairs]
+    arg_key_tokens = [_tokens(k) for k, _ in arg_pairs]
 
     for category, patterns in _RISK_PATTERNS.items():
-        matched = None
-        for pat in patterns["name"]:
-            if pat in name:
-                matched = f"tool name {tool_name!r} matches {category} pattern {pat!r}"
-                break
+        matched: Optional[str] = None
+        pat = _any_pattern_matches(name, patterns["name"])
+        if pat is not None:
+            matched = f"tool name {tool_name!r} matches {category} pattern {pat!r}"
         if matched is None:
-            for pat in patterns["arg_keys"]:
-                if any(pat in k for k in arg_keys):
+            for key_toks, (key, _v) in zip(arg_key_tokens, arg_pairs):
+                pat = next(
+                    (p for p in patterns["arg_keys"]
+                     if _pattern_matches(key_toks, p)),
+                    None,
+                )
+                if pat is not None:
                     matched = (
-                        f"argument key matches {category} pattern {pat!r} "
-                        f"on tool {tool_name!r}"
+                        f"argument key {key!r} matches {category} "
+                        f"pattern {pat!r} on tool {tool_name!r}"
                     )
                     break
         if matched is None and category == "credentials":
@@ -148,26 +227,62 @@ _READ_NAME_HINTS = ["read", "fetch", "search", "list", "get", "query",
                     "lookup", "find", "check", "download"]
 _EXEC_NAME_HINTS = ["write", "create", "update", "delete", "send", "post",
                     "publish", "deploy", "run", "exec", "terminal", "shell",
-                    "charge", "pay", "move", "remove", "install"]
+                    "charge", "pay", "move", "remove", "install",
+                    "checkout", "purchase", "order", "transfer", "refund"]
 
-_ERROR_HINTS = ("traceback", "error:", "failed", "exception", "timed out")
+# Structured error evidence only: a result IS an error when it starts with
+# an error marker or carries a machine-readable error field. A result that
+# merely MENTIONS failure ("3 failed logins blocked") is not an error.
+_ERROR_PREFIXES = ("error:", "traceback", "exception:")
 
 
-def grade_tool_result(tool_name, result, duration_ms=None):
+def _result_is_structured_error(result: Any) -> bool:
+    """True when the result IS an error report, not when it mentions one."""
+    if isinstance(result, dict):
+        return bool(result.get("error"))
+    if not isinstance(result, str):
+        return False
+    text = result.strip()
+    if text.lower().startswith(_ERROR_PREFIXES):
+        return True
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get("error"))
+
+
+def grade_tool_result(
+    tool_name: str,
+    result: Any,
+    duration_ms: Optional[int] = None,
+    status: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> dict[str, Any]:
     """Grade a tool result with an evidence level.
 
     Deterministic and conservative:
-      * empty / error-looking result -> UNKNOWN
+      * empty result -> UNKNOWN
+      * host-reported ``status="error"`` (the post_tool_call payload's own
+        ``status``/``error_type``/``error_message`` fields, derived by Hermes
+        from the result) -> UNKNOWN. Without a status, only STRUCTURED
+        error evidence counts (leading "Error:"/"Traceback", or a dict/JSON
+        ``{"error": ...}`` field) — a result that merely mentions "failed"
+        is graded normally.
       * our own verify_claim result -> pass its level through
+      * action tool (exec hints checked FIRST) -> CODE-VERIFIED
       * read/observation tool -> RUNTIME-VERIFIED (proves the tool
         returned X, never that X is true in the world)
-      * write/action tool -> CODE-VERIFIED (the runtime ran it)
       * anything else -> DECLARED
+
+    Exec-before-read ordering is deliberate: a tool that both reads and
+    acts (``get_order``) is graded as an action, understating evidence
+    rather than overstating it.
     """
     ts = utc_now()
-    name = (tool_name or "").lower()
+    name = tool_name or ""
 
-    def receipt(level, basis):
+    def receipt(level: str, basis: str) -> dict[str, Any]:
         return {
             "level": level,
             "receipt": {
@@ -180,10 +295,15 @@ def grade_tool_result(tool_name, result, duration_ms=None):
 
     if result is None or (isinstance(result, str) and not result.strip()):
         return receipt("UNKNOWN", "empty tool result — no evidence to grade")
+    if status == "error":
+        basis = "host reported an error for this tool call"
+        if error_message:
+            basis += f": {error_message[:200]}"
+        return receipt("UNKNOWN", basis)
+    if status is None and _result_is_structured_error(result):
+        return receipt("UNKNOWN", "tool result IS an error report — no evidence to grade")
+
     text = result if isinstance(result, str) else json.dumps(result, default=str)
-    lowered = text.strip().lower()
-    if any(h in lowered for h in _ERROR_HINTS):
-        return receipt("UNKNOWN", "tool result reports an error — no evidence to grade")
 
     if name == "verify_claim":
         try:
@@ -195,22 +315,58 @@ def grade_tool_result(tool_name, result, duration_ms=None):
         except Exception:
             return receipt("DECLARED", "verify_claim result unparsable — treated as declared")
 
-    if any(h in name for h in _READ_NAME_HINTS):
-        return receipt(
-            "RUNTIME-VERIFIED",
-            "live read/observation tool returned this result; it proves the "
-            "tool returned X, not that X is true in the world",
-        )
-    if any(h in name for h in _EXEC_NAME_HINTS):
+    if _any_pattern_matches(name, _EXEC_NAME_HINTS) is not None:
         return receipt(
             "CODE-VERIFIED",
             "runtime executed the action and returned this result; it is not "
             "an independent observation",
         )
+    if _any_pattern_matches(name, _READ_NAME_HINTS) is not None:
+        return receipt(
+            "RUNTIME-VERIFIED",
+            "live read/observation tool returned this result; it proves the "
+            "tool returned X, not that X is true in the world",
+        )
     return receipt(
         "DECLARED",
         "unclassified tool result — treat as the agent's report, not verified evidence",
     )
+
+
+# ---------------------------------------------------------------------------
+# Receipts — read-only access to the audit logs
+# ---------------------------------------------------------------------------
+
+_RECEIPT_LOGS = {"guard": "guard_log.jsonl", "grades": "grades_log.jsonl"}
+
+
+def read_receipts(log_name: str, limit: int = 20,
+                  data_dir: Optional[Path] = None) -> dict[str, Any]:
+    """Read the last ``limit`` records from an audit log (read-only).
+
+    ``log_name`` is "guard" or "grades". ``limit`` clamps to 1..100.
+    Returns {"log", "limit", "count", "records"}; raises ValueError for an
+    unknown log name and FileNotFoundError when the log does not exist yet
+    (callers turn that into an empty result, not a crash).
+    """
+    filename = _RECEIPT_LOGS.get((log_name or "").lower())
+    if filename is None:
+        raise ValueError(
+            f"unknown log {log_name!r}; expected one of {sorted(_RECEIPT_LOGS)}"
+        )
+    limit = max(1, min(int(limit or 20), MAX_RECEIPT_LIMIT))
+    if data_dir is None:
+        data_dir = Path.home() / ".hermes-verify"
+    path = Path(data_dir) / filename
+    lines = path.read_text(encoding="utf-8").splitlines()
+    records = []
+    for line in lines[-limit:]:
+        try:
+            records.append(json.loads(line))
+        except Exception:
+            continue  # a torn line never breaks the read
+    return {"log": log_name.lower(), "limit": limit,
+            "count": len(records), "records": records}
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +384,60 @@ we you i me my our your his her their what which who whom how why where
 """.split())
 
 
-def _key_phrases(claim, limit=8):
+class _UnsafeURL(ValueError):
+    """A fetch URL that fails the SSRF guard (non-public destination)."""
+
+
+def _validate_fetch_url(url: str) -> None:
+    """SSRF guard: allow only http(s) URLs whose host resolves entirely to
+    public IPs. Raises _UnsafeURL for anything else — private, loopback,
+    link-local, reserved, multicast, unspecified, unresolvable, or a
+    non-http(s) scheme. Literal IPs are checked without DNS; hostnames are
+    resolved with getaddrinfo and EVERY resolved address must be public.
+
+    Residual risk (documented, not hidden): DNS can change between this
+    check and the connect (TOCTOU / DNS rebinding). Closing that needs
+    connection-level IP pinning, which stdlib urllib does not offer without
+    a custom transport — out of scope for this plugin.
+    """
+    parsed = urllib.parse.urlparse((url or "").strip())
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise _UnsafeURL(f"unsupported scheme {parsed.scheme!r}; only http(s) allowed")
+    host = parsed.hostname
+    if not host:
+        raise _UnsafeURL("URL has no host")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise _UnsafeURL("URL has an invalid port")
+    try:
+        infos = socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80),
+                                   type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise _UnsafeURL(f"cannot resolve host {host!r}")
+    if not infos:
+        raise _UnsafeURL(f"cannot resolve host {host!r}")
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise _UnsafeURL(f"host {host!r} resolves to non-public address {ip}")
+
+
+class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target with the SSRF guard before
+    following it — a public URL must not smuggle the fetch to localhost
+    or the cloud metadata endpoint via a 3xx."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        _validate_fetch_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _key_phrases(claim: str, limit: int = 8) -> list[str]:
     """Content words of the claim (len>=4, not stopwords), order-preserved."""
     words = re.findall(r"[a-z0-9][a-z0-9\-']{2,}", (claim or "").lower())
-    seen = []
+    seen: list[str] = []
     for w in words:
         if len(w) >= 4 and w not in _STOPWORDS and w not in seen:
             seen.append(w)
@@ -240,12 +446,41 @@ def _key_phrases(claim, limit=8):
     return seen
 
 
-def _fetch_text(url):
-    """Fetch a URL as text. Raises on any failure. Stdlib only."""
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+_MAX_SENTENCES = 5000
+
+
+def _sentences(page: str) -> list[str]:
+    """Split page text into sentences (punctuation or newline boundaries)."""
+    parts = [s.strip() for s in _SENTENCE_SPLIT_RE.split(page or "") if s.strip()]
+    return parts[:_MAX_SENTENCES]
+
+
+def _best_sentence(page: str, phrases: list[str]) -> tuple[int, str]:
+    """The sentence containing the most key phrases, and how many it holds.
+
+    A claim is supported only when ONE sentence states it — words scattered
+    across the page ("Hermes" in the header, "tools" in the footer) are not
+    a page stating the claim.
+    """
+    best_hits = 0
+    best_text = ""
+    for sent in _sentences(page):
+        hits = sum(1 for p in phrases if p in sent)
+        if hits > best_hits:
+            best_hits, best_text = hits, sent
+    return best_hits, best_text
+
+
+def _fetch_text(url: str) -> str:
+    """Fetch a URL as text through the SSRF-guarded opener (redirects
+    re-validated). Raises on any failure. Stdlib only."""
+    _validate_fetch_url(url)
+    opener = urllib.request.build_opener(_SSRFRedirectHandler())
     req = urllib.request.Request(
         url, headers={"User-Agent": "hermes-verify/0.1.0 (+evidence check)"}
     )
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+    with opener.open(req, timeout=FETCH_TIMEOUT_S) as resp:
         raw = resp.read(MAX_FETCH_BYTES + 1)
     if len(raw) > MAX_FETCH_BYTES:
         raw = raw[:MAX_FETCH_BYTES]
@@ -257,20 +492,30 @@ def _fetch_text(url):
     return html.unescape(text).lower()
 
 
-def verify_claim(claim, source_url=None, fetch_fn=None):
+def verify_claim(
+    claim: str,
+    source_url: Optional[str] = None,
+    fetch_fn: Optional[Callable[[str], str]] = None,
+) -> dict[str, Any]:
     """Verify a claim against a live source.
 
     fetch_fn (optional, for tests): callable(url) -> page text. Defaults
-    to the real urllib fetch.
+    to the real urllib fetch. The SSRF guard runs BEFORE any fetcher, so
+    even an injected fetch_fn never sees a non-public URL.
+
+    Support is measured per sentence: the score is the fraction of the
+    claim's key phrases present in the SINGLE best sentence. Scattered
+    words across the page do not count.
 
     Returns a dict: {claim, source_url, level, verdict, evidence{...}}.
-    Never fabricates a verification: no URL, a bad URL, a failed fetch,
-    or a phrase mismatch all return UNKNOWN with the reason stated.
+    Never fabricates a verification: no URL, a bad URL, a blocked URL,
+    a failed fetch, or a phrase mismatch all return UNKNOWN with the
+    reason stated.
     """
     ts = utc_now()
     claim = (claim or "").strip()
 
-    def out(level, verdict, evidence):
+    def out(level: str, verdict: str, evidence: dict[str, Any]) -> dict[str, Any]:
         return {
             "claim": claim,
             "source_url": source_url,
@@ -286,9 +531,11 @@ def verify_claim(claim, source_url=None, fetch_fn=None):
     if not source_url:
         return out("UNKNOWN", "cannot verify without a source",
                    {"reason": "no source_url provided"})
-    if not re.match(r"^https?://", source_url.strip(), re.I):
-        return out("UNKNOWN", "unsupported source URL",
-                   {"reason": "only http(s) source URLs are supported"})
+    try:
+        _validate_fetch_url(source_url)
+    except _UnsafeURL as exc:
+        return out("UNKNOWN", "source URL blocked by SSRF guard",
+                   {"reason": str(exc)})
 
     phrases = _key_phrases(claim)
     if not phrases:
@@ -302,17 +549,19 @@ def verify_claim(claim, source_url=None, fetch_fn=None):
         return out("UNKNOWN", "source fetch failed",
                    {"reason": f"fetch failed: {type(exc).__name__}"})
 
-    found = [p for p in phrases if p in page]
-    ratio = len(found) / len(phrases)
+    best_hits, best_text = _best_sentence(page, phrases)
+    ratio = best_hits / len(phrases)
     evidence = {
         "phrases_checked": phrases,
-        "phrases_found": found,
+        "phrases_found": [p for p in phrases if p in best_text],
         "match_ratio": round(ratio, 2),
+        "best_sentence_hits": best_hits,
+        "supporting_sentence": best_text[:200],
         "fetched_chars": len(page),
     }
     if ratio >= 0.8:
         return out("EXTERNALLY-VERIFIED", "supported by source", evidence)
     if ratio >= 0.5:
         return out("PROPOSED", "partially supported by source", evidence)
-    # Absence of the phrases in this source does NOT prove the claim false.
+    # Absence of the phrases in one sentence does NOT prove the claim false.
     return out("UNKNOWN", "not supported by the fetched source", evidence)

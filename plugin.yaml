@@ -1,5 +1,5 @@
 name: hermes-verify
-version: 0.2.0
+version: 0.3.0
 description: Configurable tool-risk flags, audit metadata and held unverified-prose labels; source-matching verification remains under review.
 author: Brandon Ducar / DreamNet (Verity and Codex AI-assisted contributions)
 license: Apache-2.0
@@ -10,11 +10,14 @@ requires_hermes: ">=0.22.7"
 tags: [verification, evidence, safety, guardrails]
 provides_tools:
   - verify_claim
+  - query_receipts
 provides_hooks:
   - pre_tool_call
   - post_tool_call
   - transform_llm_output
 python_dependencies: []
+# Held output requires the declared version floor. Resolve unknown host identity
+# through supported upstream discovery, never by dropping the admission gate.
 config_schema:
   blocking_mode:
     type: bool
