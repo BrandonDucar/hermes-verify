@@ -5,12 +5,12 @@ testable without Hermes running. ``__init__.py`` is the thin Hermes-facing
 layer (register + hook wrappers) over these functions.
 
 Evidence levels (strongest -> weakest claim about a statement):
-  EXTERNALLY-VERIFIED — checked against an independent live source.
+  EXTERNALLY-VERIFIED — reserved legacy vocabulary, never granted here.
   RUNTIME-VERIFIED    — the agent's own runtime observed it (a live tool
                         result). Proves "the tool returned X", NEVER
                         "X is true in the world".
-  CODE-VERIFIED       — the runtime executed code and returned a result
-                        (a write/action completed). Not an observation.
+  CODE-VERIFIED       — legacy action-tool return category, not completed
+                        execution, delivery or payment.
   DECLARED            — asserted by the agent or a tool, not checked.
   PROPOSED            — a hypothesis / partial support; needs checking.
   UNKNOWN             — no usable evidence either way. Never fabricate.
@@ -30,8 +30,10 @@ overstating it is not.
 """
 
 import html
+import hashlib
 import ipaddress
 import json
+import math
 import re
 import socket
 import urllib.error
@@ -57,6 +59,12 @@ LEVELS = (
 FETCH_TIMEOUT_S = 10
 MAX_FETCH_BYTES = 2 * 1024 * 1024  # 2 MiB cap on fetched pages
 MAX_RECEIPT_LIMIT = 100
+MAX_JSON_NODES = 4096
+MAX_JSON_DEPTH = 12
+MAX_JSON_STRING_CHARS = 131072
+MAX_JSON_TOTAL_CHARS = 262144
+MAX_RECEIPT_SCAN_BYTES = 262144
+MAX_RECEIPT_LINE_BYTES = 16384
 
 
 def utc_now() -> str:
@@ -115,8 +123,8 @@ def _any_pattern_matches(name: str, patterns: list[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 # Patterns are matched TOKEN-wise against the tool name and argument KEY
-# names. Values are NEVER matched or logged except for the credential
-# value-pattern check, which records only the key name, never the value.
+# names. The credential value-shape check returns a fixed reason code;
+# neither the matched value nor its key name is placed in that reason.
 _RISK_PATTERNS: dict[str, dict[str, list[str]]] = {
     "spend": {
         "name": ["pay", "charge", "purchase", "buy", "checkout", "stripe",
@@ -158,21 +166,57 @@ _RISK_PATTERNS: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# Value shapes that look like a secret. Only the ARG KEY is ever recorded.
+# Value shapes that look like a secret; only a fixed reason code is returned.
 _SECRET_VALUE_RE = re.compile(
     r"^(sk-[A-Za-z0-9]|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|"
     r"xox[baprs]-[A-Za-z0-9-]{10,}|Bearer\s+\S+)"
 )
 
 
+def _json_key_values(value: Any):
+    """Inspect bounded plain JSON without coercing caller objects."""
+    stack = [(value, 0, frozenset())]
+    remaining = MAX_JSON_NODES
+    characters = MAX_JSON_TOTAL_CHARS
+    while stack:
+        current, depth, ancestors = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > MAX_JSON_DEPTH:
+            raise ValueError("HERMES_VERIFY_JSON_BUDGET")
+        kind = type(current)
+        if kind in (dict, list):
+            if id(current) in ancestors or len(current) > MAX_JSON_NODES:
+                raise ValueError("HERMES_VERIFY_JSON_SHAPE")
+            parents = ancestors | {id(current)}
+            if kind is dict:
+                for key, child in current.items():
+                    if type(key) is not str or len(key) > 256:
+                        raise ValueError("HERMES_VERIFY_JSON_KEY")
+                    characters -= len(key)
+                    yield key, child
+                    stack.append((child, depth + 1, parents))
+            else:
+                stack.extend((child, depth + 1, parents) for child in current)
+        elif kind is str:
+            if len(current) > MAX_JSON_STRING_CHARS:
+                raise ValueError("HERMES_VERIFY_JSON_STRING")
+            characters -= len(current)
+        elif kind is float:
+            if not math.isfinite(current):
+                raise ValueError("HERMES_VERIFY_JSON_NUMBER")
+        elif kind is int:
+            if current.bit_length() > 1024:
+                raise ValueError("HERMES_VERIFY_JSON_NUMBER")
+        elif current is not None and kind is not bool:
+            raise ValueError("HERMES_VERIFY_JSON_TYPE")
+        if characters < 0:
+            raise ValueError("HERMES_VERIFY_JSON_BUDGET")
+
+
 def _iter_arg_keys(args: Any, _depth: int = 0):
-    """Yield (key, value) pairs from nested arg dicts, depth-capped."""
-    if not isinstance(args, dict) or _depth > 3:
-        return
-    for key, value in args.items():
-        yield str(key), value
-        if isinstance(value, dict):
-            yield from _iter_arg_keys(value, _depth + 1)
+    if _depth != 0 or type(args) is not dict:
+        raise ValueError("HERMES_VERIFY_ARGUMENT_SHAPE")
+    yield from _json_key_values(args)
 
 
 def classify_tool_call(tool_name: str, args: Any) -> list[dict[str, str]]:
@@ -182,16 +226,18 @@ def classify_tool_call(tool_name: str, args: Any) -> list[dict[str, str]]:
     Matching is token-based on tool name + argument KEY names only. No
     argument value is ever returned or logged.
     """
-    name = tool_name or ""
+    if type(tool_name) is not str or not tool_name or len(tool_name) > 128:
+        raise ValueError("HERMES_VERIFY_TOOL_ID")
+    name = tool_name
     flags: list[dict[str, str]] = []
-    arg_pairs = list(_iter_arg_keys(args or {}))
+    arg_pairs = list(_iter_arg_keys({} if args is None else args))
     arg_key_tokens = [_tokens(k) for k, _ in arg_pairs]
 
     for category, patterns in _RISK_PATTERNS.items():
         matched: Optional[str] = None
         pat = _any_pattern_matches(name, patterns["name"])
         if pat is not None:
-            matched = f"tool name {tool_name!r} matches {category} pattern {pat!r}"
+            matched = "RISK_TOOL_" + category.upper()
         if matched is None:
             for key_toks, (key, _v) in zip(arg_key_tokens, arg_pairs):
                 pat = next(
@@ -200,18 +246,12 @@ def classify_tool_call(tool_name: str, args: Any) -> list[dict[str, str]]:
                     None,
                 )
                 if pat is not None:
-                    matched = (
-                        f"argument key {key!r} matches {category} "
-                        f"pattern {pat!r} on tool {tool_name!r}"
-                    )
+                    matched = "RISK_ARGUMENT_" + category.upper()
                     break
         if matched is None and category == "credentials":
             for key, value in arg_pairs:
                 if isinstance(value, str) and _SECRET_VALUE_RE.match(value.strip()):
-                    matched = (
-                        f"argument {key!r} on tool {tool_name!r} looks like "
-                        "a secret value (recorded key only, value withheld)"
-                    )
+                    matched = "RISK_SECRET_VALUE_SHAPE"
                     break
         if matched:
             flags.append({"category": category, "reason": matched})
@@ -237,19 +277,35 @@ _ERROR_PREFIXES = ("error:", "traceback", "exception:")
 
 
 def _result_is_structured_error(result: Any) -> bool:
-    """True when the result IS an error report, not when it mentions one."""
-    if isinstance(result, dict):
-        return bool(result.get("error"))
-    if not isinstance(result, str):
+    """Recognize reported failure, not absence of proof of success."""
+    list(_json_key_values(result))
+    payload = result
+    if type(result) is str:
+        text = result.strip()
+        if text.lower().startswith(_ERROR_PREFIXES):
+            return True
+        try:
+            payload = json.loads(text)
+        except (ValueError, RecursionError):
+            return False
+        list(_json_key_values(payload))
+    if type(payload) is not dict:
         return False
-    text = result.strip()
-    if text.lower().startswith(_ERROR_PREFIXES):
+    if payload.get("error") or payload.get("success") is False or payload.get("ok") is False:
         return True
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return False
-    return isinstance(parsed, dict) and bool(parsed.get("error"))
+    state = payload.get("status")
+    if type(state) is str and state.lower() in {
+        "error", "failed", "failure", "denied", "blocked", "cancelled", "canceled", "timeout", "timed_out",
+    }:
+        return True
+    if any(payload.get(key) is True for key in ("denied", "blocked", "cancelled", "canceled")):
+        return True
+    for key in ("exit_code", "exitCode", "returncode", "return_code", "exit_status"):
+        if key in payload:
+            code = payload[key]
+            if type(code) not in (int, float) or not math.isfinite(code) or code != 0:
+                return True
+    return False
 
 
 def grade_tool_result(
@@ -259,77 +315,64 @@ def grade_tool_result(
     status: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Grade a tool result with an evidence level.
-
-    Deterministic and conservative:
-      * empty result -> UNKNOWN
-      * host-reported ``status="error"`` (the post_tool_call payload's own
-        ``status``/``error_type``/``error_message`` fields, derived by Hermes
-        from the result) -> UNKNOWN. Without a status, only STRUCTURED
-        error evidence counts (leading "Error:"/"Traceback", or a dict/JSON
-        ``{"error": ...}`` field) — a result that merely mentions "failed"
-        is graded normally.
-      * our own verify_claim result -> pass its level through
-      * action tool (exec hints checked FIRST) -> CODE-VERIFIED
-      * read/observation tool -> RUNTIME-VERIFIED (proves the tool
-        returned X, never that X is true in the world)
-      * anything else -> DECLARED
-
-    Exec-before-read ordering is deliberate: a tool that both reads and
-    acts (``get_order``) is graded as an action, understating evidence
-    rather than overstating it.
-    """
+    """Classify observed returns without authenticating truth or completion."""
     ts = utc_now()
-    name = tool_name or ""
+    name = tool_name if type(tool_name) is str and len(tool_name) <= 128 else ""
+    safe_duration = duration_ms if type(duration_ms) in (int, float) and 0 <= duration_ms <= 604800000 else None
 
     def receipt(level: str, basis: str) -> dict[str, Any]:
         return {
+            "schema_version": "hermes-verify.tool-grade.v2",
             "level": level,
+            "outcome": "OBSERVED_RETURN_NOT_COMPLETION" if level != "UNKNOWN" else "UNKNOWN",
             "receipt": {
-                "tool": tool_name,
+                "tool_digest": hashlib.sha256(name.encode("utf-8", errors="replace")).hexdigest() if name else None,
                 "checked_at": ts,
-                "duration_ms": duration_ms,
+                "duration_ms": safe_duration,
                 "basis": basis,
             },
         }
 
-    if result is None or (isinstance(result, str) and not result.strip()):
-        return receipt("UNKNOWN", "empty tool result — no evidence to grade")
-    if status == "error":
-        basis = "host reported an error for this tool call"
-        if error_message:
-            basis += f": {error_message[:200]}"
-        return receipt("UNKNOWN", basis)
-    if status is None and _result_is_structured_error(result):
-        return receipt("UNKNOWN", "tool result IS an error report — no evidence to grade")
-
-    text = result if isinstance(result, str) else json.dumps(result, default=str)
+    if not name:
+        return receipt("UNKNOWN", "INVALID_TOOL_ID")
+    if status is not None and (type(status) is not str or len(status) > 32):
+        return receipt("UNKNOWN", "INVALID_HOST_STATUS")
+    if type(status) is str and status.lower() in {"error", "failed", "failure", "denied", "blocked", "cancelled", "canceled", "timeout", "timed_out"}:
+        return receipt("UNKNOWN", "HOST_REPORTED_FAILURE")
+    try:
+        reported_failure = _result_is_structured_error(result)
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return receipt("UNKNOWN", "UNINSPECTABLE_RESULT")
+    if result is None or (type(result) is str and not result.strip()):
+        return receipt("UNKNOWN", "EMPTY_RESULT")
+    if reported_failure:
+        return receipt("UNKNOWN", "RESULT_REPORTED_FAILURE")
 
     if name == "verify_claim":
         try:
-            verdict = json.loads(text)
-            level = verdict.get("level", "DECLARED")
-            if level not in LEVELS:
-                level = "DECLARED"
-            return receipt(level, "level passed through from verify_claim verdict")
-        except Exception:
-            return receipt("DECLARED", "verify_claim result unparsable — treated as declared")
+            verdict = json.loads(result) if type(result) is str else result
+            reported = verdict.get("level") if type(verdict) is dict else None
+            reported = reported if type(reported) is str and reported in LEVELS else None
+        except (ValueError, RecursionError):
+            reported = None
+        graded = receipt("UNKNOWN" if reported == "UNKNOWN" else "DECLARED", "UNTRUSTED_VERIFIER_RESULT")
+        if reported is not None:
+            graded["reported_level"] = reported
+        return graded
 
     if _any_pattern_matches(name, _EXEC_NAME_HINTS) is not None:
         return receipt(
             "CODE-VERIFIED",
-            "runtime executed the action and returned this result; it is not "
-            "an independent observation",
+            "OBSERVED_ACTION_RETURN_NOT_COMPLETION",
         )
     if _any_pattern_matches(name, _READ_NAME_HINTS) is not None:
         return receipt(
             "RUNTIME-VERIFIED",
-            "live read/observation tool returned this result; it proves the "
-            "tool returned X, not that X is true in the world",
+            "OBSERVED_READ_RETURN_NOT_WORLD_TRUTH",
         )
     return receipt(
         "DECLARED",
-        "unclassified tool result — treat as the agent's report, not verified evidence",
+        "UNCLASSIFIED_REPORTED_RESULT",
     )
 
 
@@ -338,35 +381,106 @@ def grade_tool_result(
 # ---------------------------------------------------------------------------
 
 _RECEIPT_LOGS = {"guard": "guard_log.jsonl", "grades": "grades_log.jsonl"}
+_CATEGORIES = frozenset(_RISK_PATTERNS)
+_BASIS_CODES = frozenset({
+    "INVALID_TOOL_ID", "INVALID_HOST_STATUS", "HOST_REPORTED_FAILURE",
+    "UNINSPECTABLE_RESULT", "EMPTY_RESULT", "RESULT_REPORTED_FAILURE",
+    "UNTRUSTED_VERIFIER_RESULT", "OBSERVED_ACTION_RETURN_NOT_COMPLETION",
+    "OBSERVED_READ_RETURN_NOT_WORLD_TRUTH", "UNCLASSIFIED_REPORTED_RESULT",
+})
+
+
+def _digest_identifier(value: Any) -> Optional[str]:
+    if type(value) is not str or len(value) > 4096:
+        return None
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _safe_record(record: Any, raw_line: bytes) -> dict[str, Any]:
+    if type(record) is not dict:
+        raise ValueError("HERMES_VERIFY_RECEIPT_SHAPE")
+    list(_json_key_values(record))
+    projected: dict[str, Any] = {
+        "schema_version": "hermes-verify.receipt-projection.v1",
+        "record_digest": hashlib.sha256(raw_line).hexdigest(),
+        "evidence_stage": "UNAUTHENTICATED_LOCAL_RECORD",
+    }
+    event = record.get("event")
+    projected["event"] = event if event in ("flagged_tool_call", "graded_tool_result") else "UNCLASSIFIED_RECORD"
+    for label, legacy in (("tool_digest", "tool"), ("task_digest", "task_id")):
+        digest = record.get(label)
+        projected[label] = digest if type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest) else _digest_identifier(record.get(legacy))
+    timestamp = record.get("ts")
+    if type(timestamp) is str and len(timestamp) <= 40:
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                projected["ts"] = parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except ValueError:
+            pass
+    if type(record.get("blocked")) is bool:
+        projected["blocked"] = record["blocked"]
+    categories = record.get("categories")
+    if type(categories) is list:
+        projected["categories"] = sorted({v for v in categories if type(v) is str and v in _CATEGORIES})
+        projected["reason_codes"] = ["RISK_" + v.upper() for v in projected["categories"]]
+    count = record.get("arg_key_count")
+    if type(count) is int and 0 <= count <= MAX_JSON_NODES:
+        projected["arg_key_count"] = count
+    level = record.get("level")
+    if type(level) is str and level in LEVELS:
+        projected["reported_level"] = level
+        projected["level"] = "UNKNOWN" if level == "UNKNOWN" else "DECLARED"
+    receipt = record.get("receipt")
+    if type(receipt) is dict:
+        basis = receipt.get("basis")
+        projected["receipt"] = {"basis": basis if type(basis) is str and basis in _BASIS_CODES else "LEGACY_UNVERIFIED_BASIS"}
+    return projected
 
 
 def read_receipts(log_name: str, limit: int = 20,
                   data_dir: Optional[Path] = None) -> dict[str, Any]:
-    """Read the last ``limit`` records from an audit log (read-only).
-
-    ``log_name`` is "guard" or "grades". ``limit`` clamps to 1..100.
-    Returns {"log", "limit", "count", "records"}; raises ValueError for an
-    unknown log name and FileNotFoundError when the log does not exist yet
-    (callers turn that into an empty result, not a crash).
-    """
-    filename = _RECEIPT_LOGS.get((log_name or "").lower())
+    """Read a bounded byte tail and return allowlisted unverified metadata."""
+    if type(log_name) is not str or len(log_name) > 16 or type(limit) is not int:
+        raise ValueError("HERMES_VERIFY_RECEIPT_QUERY_INVALID")
+    filename = _RECEIPT_LOGS.get(log_name.lower())
     if filename is None:
-        raise ValueError(
-            f"unknown log {log_name!r}; expected one of {sorted(_RECEIPT_LOGS)}"
-        )
-    limit = max(1, min(int(limit or 20), MAX_RECEIPT_LIMIT))
+        raise ValueError("HERMES_VERIFY_RECEIPT_LOG_UNKNOWN")
+    limit = max(1, min(limit, MAX_RECEIPT_LIMIT))
     if data_dir is None:
         data_dir = Path.home() / ".hermes-verify"
-    path = Path(data_dir) / filename
-    lines = path.read_text(encoding="utf-8").splitlines()
+    base = Path(data_dir).resolve()
+    path = base / filename
+    if path.is_symlink() or not path.resolve().is_relative_to(base):
+        raise ValueError("HERMES_VERIFY_RECEIPT_PATH_REJECTED")
+    with path.open("rb") as stream:
+        stream.seek(0, 2)
+        size = stream.tell()
+        start = max(0, size - MAX_RECEIPT_SCAN_BYTES)
+        stream.seek(start)
+        raw = stream.read(size - start)
+    lines = raw.splitlines()
+    skipped = 0
+    if start and lines:
+        lines = lines[1:]
+        skipped += 1
     records = []
-    for line in lines[-limit:]:
+    for line in lines:
+        if not line or len(line) > MAX_RECEIPT_LINE_BYTES:
+            skipped += 1
+            continue
         try:
-            records.append(json.loads(line))
-        except Exception:
-            continue  # a torn line never breaks the read
-    return {"log": log_name.lower(), "limit": limit,
-            "count": len(records), "records": records}
+            record = json.loads(line)
+            records.append(_safe_record(record, line))
+            if len(records) > limit:
+                del records[0]
+        except (ValueError, TypeError, RecursionError, OverflowError):
+            skipped += 1
+    return {"schema_version": "hermes-verify.receipt-query.v2", "log": log_name.lower(), "limit": limit,
+            "count": len(records), "records": records,
+            "bytes_read": len(raw), "truncated": start > 0,
+            "skipped": skipped,
+            "evidence_stage": "UNAUTHENTICATED_LOCAL_RECORDS"}
 
 
 # ---------------------------------------------------------------------------
@@ -398,17 +512,25 @@ def _validate_fetch_url(url: str) -> None:
     Residual risk (documented, not hidden): DNS can change between this
     check and the connect (TOCTOU / DNS rebinding). Closing that needs
     connection-level IP pinning, which stdlib urllib does not offer without
-    a custom transport — out of scope for this plugin.
+    a custom transport. Connection binding and proxy behavior remain pending
+    transport qualification, not certified by this address check.
     """
-    parsed = urllib.parse.urlparse((url or "").strip())
+    if type(url) is not str or len(url) > 4096 or any(ord(c) < 33 or ord(c) == 127 for c in url):
+        raise _UnsafeURL("SOURCE_URL_REJECTED")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        raise _UnsafeURL("SOURCE_URL_REJECTED") from None
     if parsed.scheme.lower() not in ("http", "https"):
         raise _UnsafeURL(f"unsupported scheme {parsed.scheme!r}; only http(s) allowed")
     host = parsed.hostname
-    if not host:
+    if not host or len(host) > 253 or parsed.username is not None or parsed.password is not None:
         raise _UnsafeURL("URL has no host")
     try:
         port = parsed.port
     except ValueError:
+        raise _UnsafeURL("URL has an invalid port")
+    if port == 0:
         raise _UnsafeURL("URL has an invalid port")
     try:
         infos = socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80),
@@ -419,7 +541,9 @@ def _validate_fetch_url(url: str) -> None:
         raise _UnsafeURL(f"cannot resolve host {host!r}")
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
+        mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+        if (not ip.is_global or (mapped is not None and not mapped.is_global)
+                or ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             raise _UnsafeURL(f"host {host!r} resolves to non-public address {ip}")
 
@@ -459,9 +583,8 @@ def _sentences(page: str) -> list[str]:
 def _best_sentence(page: str, phrases: list[str]) -> tuple[int, str]:
     """The sentence containing the most key phrases, and how many it holds.
 
-    A claim is supported only when ONE sentence states it — words scattered
-    across the page ("Hermes" in the header, "tools" in the footer) are not
-    a page stating the claim.
+    This is sentence-local lexical overlap only, not proof that the sentence
+    states or supports the claim. Negation and quantities need separate review.
     """
     best_hits = 0
     best_text = ""
@@ -478,12 +601,12 @@ def _fetch_text(url: str) -> str:
     _validate_fetch_url(url)
     opener = urllib.request.build_opener(_SSRFRedirectHandler())
     req = urllib.request.Request(
-        url, headers={"User-Agent": "hermes-verify/0.1.0 (+evidence check)"}
+        url, headers={"User-Agent": "hermes-verify/0.4.0 (+source text check)"}
     )
     with opener.open(req, timeout=FETCH_TIMEOUT_S) as resp:
         raw = resp.read(MAX_FETCH_BYTES + 1)
     if len(raw) > MAX_FETCH_BYTES:
-        raw = raw[:MAX_FETCH_BYTES]
+        raise ValueError("HERMES_VERIFY_SOURCE_BODY_LIMIT")
     text = raw.decode("utf-8", errors="replace")
     # Strip HTML tags and entities to plain text for phrase matching.
     text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
@@ -497,7 +620,7 @@ def verify_claim(
     source_url: Optional[str] = None,
     fetch_fn: Optional[Callable[[str], str]] = None,
 ) -> dict[str, Any]:
-    """Verify a claim against a live source.
+    """Compare bounded source text; lexical overlap never verifies world truth.
 
     fetch_fn (optional, for tests): callable(url) -> page text. Defaults
     to the real urllib fetch. The SSRF guard runs BEFORE any fetcher, so
@@ -508,18 +631,22 @@ def verify_claim(
     words across the page do not count.
 
     Returns a dict: {claim, source_url, level, verdict, evidence{...}}.
-    Never fabricates a verification: no URL, a bad URL, a blocked URL,
-    a failed fetch, or a phrase mismatch all return UNKNOWN with the
-    reason stated.
+    Matching yields at most PROPOSED. Missing, inaccessible or unmatched
+    evidence is UNKNOWN, never proof that a claim is false.
     """
     ts = utc_now()
-    claim = (claim or "").strip()
+    valid_claim = type(claim) is str and len(claim) <= MAX_JSON_STRING_CHARS
+    claim = claim.strip() if valid_claim else ""
+    safe_source_url = None
 
     def out(level: str, verdict: str, evidence: dict[str, Any]) -> dict[str, Any]:
         return {
+            "schema_version": "hermes-verify.source-text.v2",
             "claim": claim,
-            "source_url": source_url,
+            "source_url": safe_source_url,
             "level": level,
+            "scope": "LEXICAL_SOURCE_TEXT_ONLY",
+            "verified": False,
             "verdict": verdict,
             "evidence": evidence,
             "checked_at": ts,
@@ -533,9 +660,10 @@ def verify_claim(
                    {"reason": "no source_url provided"})
     try:
         _validate_fetch_url(source_url)
-    except _UnsafeURL as exc:
+    except _UnsafeURL:
         return out("UNKNOWN", "source URL blocked by SSRF guard",
-                   {"reason": str(exc)})
+                   {"reason": "SOURCE_URL_REJECTED"})
+    safe_source_url = source_url
 
     phrases = _key_phrases(claim)
     if not phrases:
@@ -545,6 +673,8 @@ def verify_claim(
     fetcher = fetch_fn or _fetch_text
     try:
         page = fetcher(source_url)
+        if type(page) is not str or len(page) > MAX_FETCH_BYTES:
+            raise ValueError("HERMES_VERIFY_SOURCE_TEXT_LIMIT")
     except Exception as exc:  # noqa: BLE001 — any fetch failure is UNKNOWN
         return out("UNKNOWN", "source fetch failed",
                    {"reason": f"fetch failed: {type(exc).__name__}"})
@@ -560,8 +690,8 @@ def verify_claim(
         "fetched_chars": len(page),
     }
     if ratio >= 0.8:
-        return out("EXTERNALLY-VERIFIED", "supported by source", evidence)
+        return out("PROPOSED", "lexical overlap only; truth is unverified", evidence)
     if ratio >= 0.5:
-        return out("PROPOSED", "partially supported by source", evidence)
+        return out("PROPOSED", "partial lexical overlap only; truth is unverified", evidence)
     # Absence of the phrases in one sentence does NOT prove the claim false.
-    return out("UNKNOWN", "not supported by the fetched source", evidence)
+    return out("UNKNOWN", "insufficient lexical overlap in fetched text", evidence)

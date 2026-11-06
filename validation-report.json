@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hermes-verify.validation-evidence.v2",
-  "candidateVersion": "0.3.0",
+  "candidateVersion": "0.4.0",
   "evidenceStage": "HISTORICAL_PEER_REPORT_NOT_CURRENT_VALIDATION",
   "ok": null,
   "historicalPeerReportedOk": true,

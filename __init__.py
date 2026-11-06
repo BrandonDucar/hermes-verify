@@ -121,6 +121,7 @@ def _on_pre_tool_call(tool_name, args, task_id, **kwargs):
         record = {
             "ts": _v.utc_now(),
             "event": "flagged_tool_call",
+            "schema_version": "hermes-verify.guard-record.v2",
             "tool_digest": _identifier_digest(tool_name),
             "task_digest": _identifier_digest(task_id),
             "categories": categories,
@@ -155,9 +156,11 @@ def _on_post_tool_call(tool_name, args, result, task_id, duration_ms=None,
         record = {
             "ts": _v.utc_now(),
             "event": "graded_tool_result",
-            "tool": tool_name,
-            "task_id": task_id,
+            "schema_version": "hermes-verify.grade-record.v2",
+            "tool_digest": _identifier_digest(tool_name),
+            "task_digest": _identifier_digest(task_id),
             "level": grade["level"],
+            "outcome": grade["outcome"],
             "receipt": grade["receipt"],
         }
         _append_jsonl("grades_log.jsonl", record)
@@ -247,16 +250,27 @@ QUERY_RECEIPTS_SCHEMA = {
 def _query_receipts_handler(args, **kwargs):
     """Tool handler: read-only log query, always returns a JSON string."""
     try:
-        args = args or {}
+        args = {} if args is None else args
+        if type(args) is not dict or type(args.get("log")) is not str:
+            raise ValueError("HERMES_VERIFY_RECEIPT_QUERY_INVALID")
+        limit = args.get("limit", 20)
+        if type(limit) is not int:
+            raise ValueError("HERMES_VERIFY_RECEIPT_QUERY_INVALID")
         result = _v.read_receipts(
-            str(args.get("log", "")),
-            int(args.get("limit") or 20),
+            args["log"],
+            limit,
             data_dir=_data_dir(),
         )
         return json.dumps(result)
     except FileNotFoundError:
-        return json.dumps({"log": str((args or {}).get("log", "")),
-                           "limit": 20, "count": 0, "records": []})
+        return json.dumps({
+            "schema_version": "hermes-verify.receipt-query.v2",
+            "log": args["log"].lower(),
+            "limit": max(1, min(limit, _v.MAX_RECEIPT_LIMIT)),
+            "count": 0, "records": [], "bytes_read": 0,
+            "truncated": False, "skipped": 0,
+            "evidence_stage": "UNAUTHENTICATED_LOCAL_RECORDS",
+        })
     except Exception:
         return json.dumps({"error": "HERMES_VERIFY_RECEIPT_QUERY_FAILED"})
 

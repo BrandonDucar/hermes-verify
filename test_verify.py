@@ -140,8 +140,9 @@ def test_grading():
 
     inner = json.dumps({"level": "EXTERNALLY-VERIFIED", "verdict": "supported"})
     g = v.grade_tool_result("verify_claim", inner, duration_ms=1)
-    check("grade: verify_claim passes level through",
-          g["level"] == "EXTERNALLY-VERIFIED", str(g))
+    check("grade: reported verifier level is not independent evidence",
+          g["level"] == "DECLARED" and
+          g["reported_level"] == "EXTERNALLY-VERIFIED", str(g))
 
 
 # ---------------------------------------------------------------- verify_claim
@@ -157,8 +158,9 @@ def test_verify_claim():
     r = v.verify_claim("The Hermes plugin system lets developers add tools and hooks",
                        "https://93.184.216.34/plugins",
                        fetch_fn=lambda url: PAGE.lower())
-    check("verify_claim: matching source -> EXTERNALLY-VERIFIED",
-          r["level"] == "EXTERNALLY-VERIFIED", str(r))
+    check("verify_claim: matching text is a lexical proposal only",
+          r["level"] == "PROPOSED" and r["verified"] is False and
+          r["scope"] == "LEXICAL_SOURCE_TEXT_ONLY", str(r))
 
     r = v.verify_claim("Quantum entanglement breaks causality in dolphins",
                        "https://93.184.216.34/plugins",
@@ -311,8 +313,8 @@ def test_sentence_window():
         "https://93.184.216.34/docs",
         fetch_fn=lambda url: together.lower(),
     )
-    check("teardown: one sentence stating the claim -> EXTERNALLY-VERIFIED",
-          r["level"] == "EXTERNALLY-VERIFIED", str(r))
+    check("teardown: same-sentence overlap is not factual verification",
+          r["level"] == "PROPOSED" and r["verified"] is False, str(r))
 
 
 def test_ssrf_guard():
@@ -395,8 +397,9 @@ def test_receipts_tool():
             pkg._append_jsonl("guard_log.jsonl", {"event": "flagged_tool_call", "tool": "c"})
             out = pkg._query_receipts_handler({"log": "guard", "limit": 2})
             parsed = json.loads(out)
-            check("teardown: query_receipts returns last N guard records",
-                  [r["tool"] for r in parsed["records"]] == ["b", "c"], out)
+            check("teardown: query_receipts returns safe last N projections",
+                  [r["tool_digest"] for r in parsed["records"]] ==
+                  [v.hashlib.sha256(name.encode()).hexdigest() for name in ("b", "c")], out)
 
             out = pkg._query_receipts_handler({"log": "guard", "limit": 500})
             parsed = json.loads(out)

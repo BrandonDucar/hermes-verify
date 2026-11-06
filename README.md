@@ -1,7 +1,7 @@
 # hermes-verify
 
 Evidence labeling and configurable tool-risk interception for Hermes Agent.
-Version 0.3.0 is a combined development candidate, not a truth oracle or a complete
+Version 0.4.0 is a combined development candidate, not a truth oracle or a complete
 security boundary. Source matching and tool names do not establish that a
 claim is true or an action succeeded.
 
@@ -12,6 +12,9 @@ Brandon Ducar's direction. Native qualification and adversarial review are
 separate from the offline fixtures; catalog submission is not yet complete.
 This combines Verity's public `5c8cad5b1d45eee91deeebf6a48754c18c8fba0c`
 with Codex's local `82141f73414d234c2e6af6b6978759e274bac33e`, retaining both histories.
+The v0.4 corrections build on their combined `ed45cc4` checkpoint. Verity's
+classifier, token matching and sentence-locality work remain; Codex's later
+corrections separate those observations from factual verification.
 
 ## Held Output And Receipts
 
@@ -42,37 +45,40 @@ It is namespaced and read-only; no existing memory or skills are overwritten.
 | **pre_tool_call guard** | Token-based classification of spend, send, publish, deploy, credential and generic execution tools. Default mode logs and allows; explicit blocking mode vetoes flagged calls. Exceptional paths remain under review. |
 | **post_tool_call grader** | Writes result-grade metadata considering host status and structured errors. It does not independently verify action completion or rewrite model-bound tool results. |
 | **transform_llm_output** | Holds the finished reply on supported Hermes surfaces and adds an explicit unverified-prose label. This is not per-claim truth verification. |
-| **verify_claim tool** | Development-only lexical comparison against fetched source text. Returned legacy grades are untrusted metadata, not semantic support or independent factual verification. Missing sources and fetch failures return `UNKNOWN`. |
+| **verify_claim tool** | Bounded sentence-window lexical comparison. Matching returns at most `PROPOSED`, with `scope=LEXICAL_SOURCE_TEXT_ONLY` and `verified=false`. Missing sources and fetch failures are `UNKNOWN`, not proof of falsity. |
 | **query_receipts tool** | Read-only access to the guard/grades audit logs (`log: "guard"` or `"grades"`, limit 1–100, default 20) so the agent can show receipts instead of claiming them from memory. |
 
 ## Evidence levels
 
 | Level | Meaning |
 | --- | --- |
-| `EXTERNALLY-VERIFIED` | Checked against an independent live source that supports the claim. |
+| `EXTERNALLY-VERIFIED` | Reserved legacy vocabulary; this lexical checker never grants it. A reported label is not authenticated evidence. |
 | `RUNTIME-VERIFIED` | The agent's own runtime observed it (a live tool result). Proves **"the tool returned X"** — never "X is true in the world". |
-| `CODE-VERIFIED` | The runtime executed code and returned a result (a write/action completed). Not an independent observation. |
+| `CODE-VERIFIED` | Legacy action-tool return category, not proof of successful completion, delivery, payment or deployment. |
 | `DECLARED` | Asserted by the agent or a tool, not checked. |
 | `PROPOSED` | A hypothesis, or partially supported by a source. Needs checking. |
 | `UNKNOWN` | No usable evidence either way. Absence of support is **not** proof a claim is false. |
 
-The current scaffold's tool-name and phrase heuristics are development
+The current core's tool-name and phrase heuristics are development
 metadata, not independent verification. In particular, a write tool returning
 text is not proof of delivery, deployment or payment, and a phrase match is
 not semantic source support. The grader currently writes to an audit log;
 `post_tool_call` cannot rewrite what the model receives. Graded-result
 enforcement and live source verification remain under review.
 
-Legacy grading behavior retained from the scaffold:
+Grading behavior:
 
 - Read/observation tools (`read_file`, `web_search`, `web_fetch`, …) →
   `RUNTIME-VERIFIED` for the observation itself.
 - Write/action tools (`write_file`, `send_email`, `terminal`, `stripe_checkout`, …) →
-  `CODE-VERIFIED` for the execution. Action hints win over read hints.
-- Empty results, host-reported errors (`status="error"`), or structured
-  error reports → `UNKNOWN`.
+  `CODE-VERIFIED` for the reported return, not completed execution. Action hints win.
+- Empty or uninspectable results, reported errors/denial/cancellation, explicit
+  false success or nonzero exit states are `UNKNOWN`, even with host `status=ok`.
+  A sentence merely mentioning failure is not automatically an error.
 - Anything unclassified → `DECLARED`.
-- `verify_claim` results pass their own level through.
+- A verifier's reported level is separate metadata, never promoted to an
+  independently verified grade. A bare `EXTERNALLY-VERIFIED` result is `DECLARED`.
+- Observed-return grades explicitly state that they do not establish completion.
 
 ## Install
 
@@ -85,7 +91,8 @@ No API keys, no Python dependencies (stdlib only), no privileged
 capabilities requested. The plugin's only network access is the
 `verify_claim` tool fetching a URL the user (or the agent) supplies,
 10s timeout, 2 MiB cap, http(s) only, SSRF-guarded to public IPs
-(including redirect targets). Residual SSRF note: DNS can change
+(including selected redirect targets). Userinfo, port zero and non-global/shared
+addresses are refused. Residual SSRF note: DNS can change
 between the guard's check and the connect (TOCTOU); closing that needs
 connection-level IP pinning, which stdlib urllib does not offer.
 
@@ -113,21 +120,30 @@ Set it in the Desktop app (Settings → Plugins → hermes-verify) or in
 ## Audit logs
 
 Logs live in the plugin data dir (`<HERMES_HOME>/plugin-data/hermes-verify/`,
-survives updates/removes) as JSONL, one record per line. Argument values are not
-intentionally recorded, but arbitrary key names, identifiers and diagnostics
-remain unqualified for privacy. Use synthetic inputs during qualification:
+survives updates/removes) as JSONL, one record per line. New guard and grade
+records omit raw arguments, identifiers and error messages. Use synthetic inputs
+during qualification; this is not a general-purpose privacy scrubber:
 
 - `guard_log.jsonl` - newly flagged calls: timestamp, tool/task digests, fixed
   categories/reason codes, argument-key count and blocked yes/no. Arbitrary key
   names and exception messages are omitted from these new guard records.
-- `grades_log.jsonl` — graded tool results: timestamp, tool, task id,
-  level, receipt (tool, timestamp, duration, basis).
+- `grades_log.jsonl` - timestamps, identifier digests, scoped grade/outcome and
+  fixed receipt basis codes. A host error's text is not copied into the receipt.
 
 Read them live with the `query_receipts` tool instead of opening the
 files by hand.
-Old records are not rewritten. Digests can correlate identifiers and are not
-anonymization; grader records and raw receipt queries remain separate privacy
-review scope. This is not a universal privacy guarantee.
+Queries read at most 256 KiB from the log tail, skip lines over 16 KiB and return
+at most 100 allowlisted metadata records, never raw legacy keys/errors/content.
+Truncation and skipped records are explicit; the query is not a full-log audit.
+Old files are not rewritten or deleted. Digests correlate data and are not
+anonymization or authentication. File races, retention and audience access remain
+host responsibilities, not an OS sandbox or universal privacy guarantee.
+
+Argument/result inspection accepts bounded plain JSON: 4,096 visited values,
+depth 12, 131,072 characters per value string and 262,144 aggregate key/value
+characters. Dictionary and list containers are inspected. Non-JSON objects,
+cycles, nonfinite numbers and exhausted budgets cannot appear safely inspected;
+strict mode blocks classifier failure, while observation mode remains nonblocking.
 
 ## Tests
 
@@ -140,19 +156,31 @@ are suite entrypoints, not proof that those effects have been contained:
 python3 test_verify.py
 python3 test_output.py
 python3 test_registration.py
+python3 test_core_boundaries.py
+python3 test_url_admission.py
 ```
 
 The earlier local branch passed 75 synthetic cases: 35 legacy core, 34 output
 and six fake-registration cases. Verity's later core reports 67 cases. These
 are overlapping tests of different snapshots, not 142 independent cases. This
-combined candidate needs its own source-bound run and independent review.
+v0.3 combined candidate passed 121 synthetic cases. The v0.4 candidate passed
+161 offline cases: 69 core, 34 output, six fake-registration, 31 core-boundary,
+nine URL-admission and 12 private guard challenges. These overlap the earlier
+121; they are not 282 unique cases. The 12 private guard challenges are retained
+in the local qualification audit, not included in the five commands above.
+The frozen 30-case core challenge set produced three passing and 27 failing
+assertions against the retained parent, with five denied read attempts reported
+separately by the audit guard. That baseline is not clean runtime qualification
+or a count of independent vulnerabilities. The candidate had zero denied attempts.
+The 31st core-boundary case covers the review-discovered empty-log v2 envelope;
+it failed against the pre-fix wrapper and passed after correction.
 Native hooks, actual stream delivery, transport policy and catalog admission
 remain separate checks. Existing unsafe-path findings are not closed by a banner
 or by changing a test expectation to match inherited behavior.
 
 ## Files
 
-- `plugin.yaml` - manifest v2, version0.3.0, declared tools/hooks and the retained
+- `plugin.yaml` - manifest v2, version0.4.0, declared tools/hooks and the retained
   `requires_hermes >=0.22.7` admission floor. No privileged override is requested.
 - `__init__.py` — `register(ctx)`, hook wrappers, `verify_claim` and
   `query_receipts` handlers.
