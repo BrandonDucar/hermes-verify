@@ -117,14 +117,23 @@ source-import environment. Doctor observed two tools, three hooks and no finding
 each native run reported two warnings whose details were not captured. These are
 scoped native results, not installed-runtime or full-validation certification.
 The SDK tracked-dirty observation timed out, so no clean-tree claim follows.
-Agent-stream delivery, strict-mode integration and full CLI validation remain
-pending. The earlier v0.4 results remain historical rather than being reused.
+The unchanged upstream validator from Hermes SDK commit
+`b200f5bc60e31588ba2cb60e288029c4a54ba5fa` subsequently passed all 15 applicable
+Python-plugin report checks in an isolated native run. This included its actual
+capability-probe subprocess, source/security checks and built-in collision
+discovery. Its validation warning list was empty; an upstream Python
+DeprecationWarning and two capability-recorder registration notices were
+retained separately. The static isolation audit reported host-ready, not proof
+of an operating isolated host. Desktop and language-pack checker functions ran,
+but this plugin declares neither surface; no synthetic check result was added.
+Agent-stream delivery, strict-mode integration and the installed CLI environment
+remain unqualified. The earlier v0.4 results remain historical rather than reused.
 
 ## Config
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `blocking_mode` | bool | `false` | When `true`, flagged tool calls are **blocked** (`pre_tool_call` returns a block directive) and the user must approve them. When `false` (default), flagged calls are logged and allowed through. |
+| `blocking_mode` | bool | `false` | When `true`, flagged tool calls are vetoed (`pre_tool_call` returns a block directive). No approval UI, one-time approval token or automatic resume is supplied. When `false` (default), flagged calls are logged and allowed through. |
 
 Blocking is a veto, not an approval interface or a one-time approval token.
 This development mode does not implement an approval-and-resume workflow.
@@ -142,6 +151,12 @@ Logs live in the plugin data dir (`<HERMES_HOME>/plugin-data/hermes-verify/`,
 survives updates/removes) as JSONL, one record per line. New guard and grade
 records omit raw arguments, identifiers and error messages. Use synthetic inputs
 during qualification; this is not a general-purpose privacy scrubber:
+
+Storage caveat: if importing or calling the host's `plugin_data_dir` helper
+raises, the implementation falls back to `HERMES_VERIFY_DATA_DIR`, when set,
+or `<user-home>/.hermes-verify`. That can happen inside Hermes as well as in a
+standalone test. This fallback is not guaranteed to follow the active profile;
+host storage errors must not be mistaken for verified profile isolation.
 
 - `guard_log.jsonl` - newly flagged calls: timestamp, tool/task digests, fixed
   categories/reason codes, argument-key count and blocked yes/no. Arbitrary key
