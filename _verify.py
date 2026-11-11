@@ -810,17 +810,54 @@ def _best_sentence(page: str, phrases: list[str]) -> tuple[int, str]:
     return best_hits, best_text
 
 
+_HTML_TAG_CASE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _strip_html(text: str) -> str:
+    """Walk disjoint spans; malformed input must not restart an unbounded scan."""
+    for tag in ("script", "style"):
+        # HTML names use ASCII case; Unicode lower() can change string offsets.
+        folded = text.translate(_HTML_TAG_CASE)
+        opening, closing = "<" + tag, "</" + tag + ">"
+        parts, cursor = [], 0
+        while True:
+            start = folded.find(opening, cursor)
+            if start < 0:
+                parts.append(text[cursor:])
+                break
+            parts.extend((text[cursor:start], " "))
+            end = folded.find(closing, start + len(opening))
+            if end < 0:
+                break  # Unterminated raw content is not visible source evidence.
+            cursor = end + len(closing)
+        text = "".join(parts)
+    parts, cursor = [], 0
+    while True:
+        start = text.find("<", cursor)
+        if start < 0:
+            parts.append(text[cursor:])
+            break
+        end = text.find(">", start + 1)
+        if end < 0:
+            parts.append(text[cursor:])
+            break
+        # Preserve literal <> just as the former <[^>]+> expression did.
+        parts.extend((text[cursor:start], "<>" if end == start + 1 else " "))
+        cursor = end + 1
+    return "".join(parts)
+
+
 def _fetch_text(url: str, *, _target=None, _deadline=None) -> str:
     """Fetch public text through pinned direct connections; never use ambient proxies."""
     deadline = _deadline or _Deadline(FETCH_TIMEOUT_S)
     raw = _fetch_bytes(url, _target=_target, _deadline=deadline)
     if len(raw) > MAX_FETCH_BYTES:
         raise ValueError("HERMES_VERIFY_SOURCE_BODY_LIMIT")
+    deadline.remaining()
     text = raw.decode("utf-8", errors="replace")
     # Strip HTML tags and entities to plain text for phrase matching.
-    text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
-    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
+    deadline.remaining()
+    text = _strip_html(text)
     text = html.unescape(text).lower()
     deadline.remaining()
     return text

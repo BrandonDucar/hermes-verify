@@ -593,6 +593,87 @@ class TransportBoundaries(unittest.TestCase):
             for _ in acquired:
                 self.v._DNS_SLOTS.release()
 
+    def assert_fast_html_fetch(self, body, expected, label):
+        self.assertEqual(len(body), self.v.MAX_FETCH_BYTES)
+        with mock.patch.object(self.v, "_fetch_bytes", return_value=body):
+            started = time.perf_counter()
+            result = self.fetch()
+            elapsed = time.perf_counter() - started
+        self.assertEqual(result, expected)
+        self.assertLess(elapsed, 1.0, "2 MiB HTML preprocessing exceeded one second")
+        print(f"HTML_STRIP_TIMING={label} bytes={len(body)} seconds={elapsed:.6f}")
+
+    def test_html_two_mib_unclosed_script(self):
+        body = (b"<script" * (self.v.MAX_FETCH_BYTES // 7 + 1))[:self.v.MAX_FETCH_BYTES]
+        self.assert_fast_html_fetch(body, " ", "unclosed-script")
+
+    def test_html_two_mib_unclosed_style(self):
+        body = (b"<StYlE" * (self.v.MAX_FETCH_BYTES // 6 + 1))[:self.v.MAX_FETCH_BYTES]
+        self.assert_fast_html_fetch(body, " ", "unclosed-style")
+
+    def test_html_two_mib_unclosed_generic_tags(self):
+        body = b"<" * self.v.MAX_FETCH_BYTES
+        self.assert_fast_html_fetch(body, body.decode(), "unclosed-generic")
+
+    def test_html_two_mib_many_closed_raw_elements(self):
+        for tag in ("script", "style"):
+            with self.subTest(tag=tag):
+                element = f"<{tag}>ignored</{tag}>".encode()
+                count, tail = divmod(self.v.MAX_FETCH_BYTES, len(element))
+                body = element * count + b"x" * tail
+                self.assert_fast_html_fetch(body, " " * count + "x" * tail, "closed-" + tag)
+
+    def test_html_closed_blocks_case_multiline_and_entities(self):
+        body = (b"Before<ScRiPt type='text/plain'>\nsecret <script> nested\n</sCrIpT>"
+                b"Middle<STYLE media='all'>\n.secret{}\n</style>After &amp; END")
+        with mock.patch.object(self.v, "_fetch_bytes", return_value=body):
+            self.assertEqual(self.fetch(), "before middle after & end")
+
+    def test_html_unterminated_raw_blocks_drop_remaining(self):
+        for body in (b"Visible<script ignored <script hidden", b"Visible<STYLE>hidden",
+                     b"Visible<script", b"Visible<styLE"):
+            with self.subTest(body=body), mock.patch.object(self.v, "_fetch_bytes", return_value=body):
+                self.assertEqual(self.fetch(), "visible ")
+
+    def test_html_generic_tags_empty_and_unclosed(self):
+        body = b"<>Alpha<p class='q'>Beta</p>tail<broken"
+        with mock.patch.object(self.v, "_fetch_bytes", return_value=body):
+            self.assertEqual(self.fetch(), "<>alpha beta tail<broken")
+
+    def test_html_expired_budget_prevents_decode(self):
+        decoded = []
+
+        class ObservableBytes(bytes):
+            def decode(self, *args, **kwargs):
+                decoded.append(True)
+                return super().decode(*args, **kwargs)
+
+        def expired_fetch(*args, **kwargs):
+            self.net.clock.advance(self.v.FETCH_TIMEOUT_S + 1)
+            return ObservableBytes(b"<script>ignored</script>")
+
+        with mock.patch.object(self.v, "_fetch_bytes", side_effect=expired_fetch):
+            with self.assertRaises(TimeoutError):
+                self.fetch()
+        self.assertEqual(decoded, [], "expired fetch must refuse before HTML preprocessing")
+
+    def test_html_budget_expiring_during_decode_still_refuses(self):
+        clock = self.net.clock
+
+        class SlowDecode(bytes):
+            def decode(self, *args, **kwargs):
+                clock.advance(11)
+                return super().decode(*args, **kwargs)
+
+        with mock.patch.object(self.v, "_fetch_bytes", return_value=SlowDecode(b"<p>alpha</p>")):
+            with self.assertRaises(TimeoutError):
+                self.fetch()
+
+    def test_html_ascii_tag_folding_keeps_unicode_text_positions(self):
+        body = "İ ſ K before<ScRiPt>hidden</SCRIPT>after<STYLE>hidden</style>Ω".encode()
+        with mock.patch.object(self.v, "_fetch_bytes", return_value=body):
+            self.assertEqual(self.fetch(), "i\u0307 ſ k before after ω")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
